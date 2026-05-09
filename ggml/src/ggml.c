@@ -1559,7 +1559,40 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
 
     ggml_critical_section_end();
 
-    struct ggml_context * ctx = GGML_MALLOC(sizeof(struct ggml_context));
+    // whispercpp-sys: ggml_init OOM-safe context alloc
+    //
+    // Pre-patch: `GGML_MALLOC(sizeof(struct ggml_context))`
+    // calls `GGML_ABORT("fatal error")` on malloc failure
+    // (`ggml.c::ggml_malloc:412`), and the post-arena
+    // assert `GGML_ASSERT(ctx->mem_buffer != NULL)` calls
+    // `GGML_ABORT(...)` if `ggml_aligned_malloc` returned
+    // NULL (out of memory). Both abort paths terminate the
+    // process via `abort()` before any C++ exception
+    // handler can run. The whispercpp Rust wrapper's DTW
+    // path calls `ggml_init` at decode time with a
+    // ~hundreds-of-MB working arena; under host memory
+    // pressure these aborts become process-termination
+    // paths reachable from safe Rust through
+    // `ContextParams::with_dtw_token_timestamps`. The
+    // wrapper's `whispercpp_full_with_state` exception
+    // shim is bypassed entirely — `abort()` is uncatchable.
+    //
+    // Replace with plain `malloc` + NULL-handling so the
+    // OOM signal propagates back to the caller. The
+    // upstream abort-on-OOM behaviour relied on a
+    // "allocation can't fail" assumption that's false on
+    // memory-pressured hosts and impossible to satisfy
+    // from a multi-GB DTW arena. Existing whisper.cpp
+    // callers already null-check `ggml_init`'s return
+    // (e.g. `whisper.cpp:1251` in `aheads_masks_init`),
+    // so the new return path is the contract some upstream
+    // sites already expected.
+    struct ggml_context * ctx = malloc(sizeof(struct ggml_context));
+    if (ctx == NULL) {
+        GGML_LOG_ERROR("%s: failed to allocate %zu bytes for ggml_context\n",
+                       __func__, sizeof(struct ggml_context));
+        return NULL;
+    }
 
     // allow to call ggml_init with 0 size
     if (params.mem_size == 0) {
@@ -1568,17 +1601,25 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
 
     const size_t mem_size = params.mem_buffer ? params.mem_size : GGML_PAD(params.mem_size, GGML_MEM_ALIGN);
 
+    void * mem_buffer = params.mem_buffer ? params.mem_buffer : ggml_aligned_malloc(mem_size);
+    if (mem_buffer == NULL) {
+        // Arena allocation failed; free the just-allocated
+        // context struct and return NULL. `ggml_aligned_malloc`
+        // already logs via `GGML_LOG_ERROR` on its failure
+        // path; we don't double-log.
+        free(ctx);
+        return NULL;
+    }
+
     *ctx = (struct ggml_context) {
         /*.mem_size           =*/ mem_size,
-        /*.mem_buffer         =*/ params.mem_buffer ? params.mem_buffer : ggml_aligned_malloc(mem_size),
+        /*.mem_buffer         =*/ mem_buffer,
         /*.mem_buffer_owned   =*/ params.mem_buffer ? false : true,
         /*.no_alloc           =*/ params.no_alloc,
         /*.n_objects          =*/ 0,
         /*.objects_begin      =*/ NULL,
         /*.objects_end        =*/ NULL,
     };
-
-    GGML_ASSERT(ctx->mem_buffer != NULL);
 
     GGML_ASSERT_ALIGNED(ctx->mem_buffer);
 

@@ -160,6 +160,15 @@ static int ggml_dyn_tallocr_new_chunk(struct ggml_dyn_tallocr * alloc, size_t mi
         return -1;
     }
     struct tallocr_chunk * chunk = calloc(1, sizeof(struct tallocr_chunk));
+    // whispercpp-sys: dyn_tallocr_new_chunk OOM-safe alloc
+    //
+    // The function already returns -1 for capacity
+    // exhaustion. Reuse the same sentinel for OOM —
+    // `ggml_dyn_tallocr_alloc` distinguishes the two via
+    // its own logging.
+    if (chunk == NULL) {
+        return -1;
+    }
     chunk->n_free_blocks = 1;
     chunk->free_blocks[0].offset = 0;
     // available space in a chunk is limited to max_chunk_size, but can be higher if:
@@ -250,10 +259,25 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
         best_fit_block = 0;
     }
     if (best_fit_chunk == -1) {
-        // since the last chunk always has virtually endless memory, this should never happen
+        // whispercpp-sys: dyn_tallocr_alloc OOM-safe sentinel
+        //
+        // Upstream aborted here. Two reachable causes:
+        //   * `GGML_VBUFFER_MAX_CHUNKS` exhaustion — should
+        //     never happen per upstream's comment.
+        //   * `ggml_dyn_tallocr_new_chunk` calloc failure
+        //     (now wired to return -1 instead of deref'ing
+        //     NULL).
+        //
+        // Return `GGML_BUFFER_ADDRESS_INVALID`
+        // (chunk = -1, offset = SIZE_MAX); the single
+        // caller, `ggml_gallocr_alloc_node`, detects it
+        // (chunk == -1) and sets the gallocr's
+        // `alloc_failed` sticky bit so
+        // `ggml_gallocr_reserve_n_impl` returns `false`
+        // after the graph walk completes.
         GGML_LOG_ERROR("%s: not enough space in the buffer to allocate %zu bytes, largest block available %zu bytes\n",
             __func__, size, max_avail);
-        GGML_ABORT("graph allocation: failed to reserve memory");
+        return GGML_BUFFER_ADDRESS_INVALID;
     }
 
     struct tallocr_chunk * chunk = alloc->chunks[best_fit_chunk];
@@ -362,7 +386,17 @@ static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
 }
 
 static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t max_buffer_size) {
+    // whispercpp-sys: dyn_tallocr_new OOM-safe alloc
+    //
+    // Upstream's `malloc` was unchecked; `*alloc = (...)`
+    // would null-deref on OOM, aborting the process via
+    // SIGSEGV before the wrapper's exception shim could
+    // surface a clean error. Return NULL so callers
+    // (`ggml_gallocr_new_n`) propagate the failure.
     struct ggml_dyn_tallocr * alloc = (struct ggml_dyn_tallocr *)malloc(sizeof(struct ggml_dyn_tallocr));
+    if (alloc == NULL) {
+        return NULL;
+    }
 
     *alloc = (struct ggml_dyn_tallocr) {
         /*.alignment      = */ alignment,
@@ -380,6 +414,14 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
 }
 
 static void ggml_dyn_tallocr_free(struct ggml_dyn_tallocr * alloc) {
+    // whispercpp-sys: dyn_tallocr_free NULL guard
+    //
+    // Required so `ggml_gallocr_free`'s walk over partially
+    // initialised `buf_tallocs[]` (some slots NULL after
+    // `dyn_tallocr_new` failure) doesn't deref.
+    if (alloc == NULL) {
+        return;
+    }
     for (int i = 0; i < alloc->n_chunks; ++i) {
         free(alloc->chunks[i]);
     }
@@ -491,20 +533,70 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // whispercpp-sys: gallocr alloc-failure flag
+    //
+    // Sticky bit set by `ggml_gallocr_alloc_node` when
+    // `ggml_dyn_tallocr_alloc` reports inability to extend
+    // the chunk pool (calloc returned NULL on the new
+    // chunk). The graph-allocation pipeline is fire-and-
+    // forget — `ggml_gallocr_alloc_graph_impl` calls
+    // `_alloc_node` in a loop without return checking — so
+    // this flag is the propagation channel: once set,
+    // subsequent `_alloc_node` calls short-circuit, and
+    // `ggml_gallocr_reserve_n_impl` returns `false` after
+    // the graph-walk finishes. Callers
+    // (`ggml_backend_sched_alloc_graph` →
+    // `whisper_sched_graph_init`) already handle the
+    // bool-failure path.
+    bool alloc_failed;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
+    // whispercpp-sys: gallocr_new_n OOM-safe alloc
+    //
+    // Replaces every `GGML_ASSERT(... != NULL)` with an
+    // explicit check + `ggml_gallocr_free`-and-return-NULL.
+    // `ggml_gallocr_free` is safe on a partial galloc
+    // because:
+    //   * The struct is zero-initialised by the top
+    //     `calloc` so all pointer fields not yet
+    //     overwritten are NULL — `free(NULL)` is a no-op.
+    //   * `n_buffers` is set BEFORE the `_dyn_tallocr_new`
+    //     loop so the cleanup walk has the right bound;
+    //     unset slots are NULL via calloc, and
+    //     `ggml_dyn_tallocr_free(NULL)` is a no-op via the
+    //     `dyn_tallocr_new OOM-safe alloc` patch.
+    //
+    // Caller (`ggml_backend_sched_new`) checks for NULL
+    // and routes through `ggml_backend_sched_free`.
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
-    GGML_ASSERT(galloc != NULL);
+    if (galloc == NULL) {
+        return NULL;
+    }
 
     galloc->bufts = calloc(n_bufs, sizeof(ggml_backend_buffer_type_t));
-    GGML_ASSERT(galloc->bufts != NULL);
+    if (galloc->bufts == NULL) {
+        ggml_gallocr_free(galloc);
+        return NULL;
+    }
 
     galloc->buffers = calloc(n_bufs, sizeof(struct vbuffer *));
-    GGML_ASSERT(galloc->buffers != NULL);
+    if (galloc->buffers == NULL) {
+        ggml_gallocr_free(galloc);
+        return NULL;
+    }
 
     galloc->buf_tallocs = calloc(n_bufs, sizeof(struct ggml_dyn_tallocr *));
-    GGML_ASSERT(galloc->buf_tallocs != NULL);
+    if (galloc->buf_tallocs == NULL) {
+        ggml_gallocr_free(galloc);
+        return NULL;
+    }
+
+    // Pin n_buffers BEFORE the _dyn_tallocr_new loop so
+    // the cleanup walk in `ggml_gallocr_free` covers the
+    // partial-init range.
+    galloc->n_buffers = n_bufs;
 
     for (int i = 0; i < n_bufs; i++) {
         galloc->bufts[i] = bufts[i];
@@ -522,9 +614,20 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
             size_t alignment = ggml_backend_buft_get_alignment(bufts[i]);
             size_t max_size = ggml_backend_buft_get_max_size(bufts[i]);
             galloc->buf_tallocs[i] = ggml_dyn_tallocr_new(alignment, max_size);
+            if (galloc->buf_tallocs[i] == NULL) {
+                // whispercpp-sys: dyn_tallocr_new failure cleanup
+                //
+                // Earlier slots may share entries with later
+                // bufts of the same type (the dedup loop
+                // above). `ggml_gallocr_free` walks
+                // `0..n_buffers` and de-duplicates against
+                // already-freed pointers; the failed slot is
+                // still NULL via the calloc.
+                ggml_gallocr_free(galloc);
+                return NULL;
+            }
         }
     }
-    galloc->n_buffers = n_bufs;
 
     return galloc;
 }
@@ -620,6 +723,16 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
 
 static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0);
+    // whispercpp-sys: gallocr alloc-failure short-circuit
+    //
+    // Once `alloc_failed` is set, every subsequent
+    // `_dyn_tallocr_alloc` would also fail (or worse,
+    // succeed against a stale layout). Bail without
+    // touching the hash node so the gallocr's flag
+    // propagates intact to `_reserve_n_impl`.
+    if (galloc->alloc_failed) {
+        return;
+    }
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
 
     if (!ggml_gallocr_is_allocated(galloc, node) && !ggml_impl_is_view(node)) {
@@ -683,6 +796,29 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         size_t size = ggml_backend_buft_get_alloc_size(buft, node);
         hn->buffer_id = buffer_id;
         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
+        // whispercpp-sys: gallocr alloc-failure detection
+        //
+        // `_dyn_tallocr_alloc` reports inability to extend
+        // the chunk pool by returning chunk = -1 (with
+        // `GGML_BUFFER_ADDRESS_INVALID` offset). Set the
+        // gallocr's sticky flag so `_reserve_n_impl`
+        // returns false after the graph walk.
+        //
+        // Critical: clear `hn->allocated` (set true at the
+        // top of this branch). Without this, a subsequent
+        // node's parent-reuse path can call
+        // `ggml_gallocr_free_node` on this node (gated by
+        // `if (p_hn->allocated)`), which would index
+        // `alloc->chunks[hn->addr.chunk]` with chunk = -1
+        // — out-of-bounds native UB. Clearing the flag
+        // ensures every later free/reuse check skips this
+        // node; the sticky `alloc_failed` flag plus the
+        // short-circuit at the top of `_allocate_node`
+        // prevent any forward progress.
+        if (hn->addr.chunk == -1) {
+            hn->allocated = false;
+            galloc->alloc_failed = true;
+        }
     }
 }
 
@@ -694,6 +830,22 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     }
 
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+    // whispercpp-sys: gallocr_free_node invalid-chunk guard
+    //
+    // Defense in depth: an `hn->addr.chunk` of -1 means the
+    // node's allocation hit the recoverable-OOM sentinel
+    // path. The primary fix at `_allocate_node` clears
+    // `hn->allocated` so callers' `if (p_hn->allocated)`
+    // gate skips this branch, but the guard here covers
+    // any future caller that bypasses that gate (and makes
+    // the contract explicit). Without it, the AT_PRINTF
+    // below would index `alloc->chunks[-1]` and
+    // `ggml_dyn_tallocr_free_bytes` would deref the
+    // resulting OOB pointer — out-of-bounds native UB on
+    // a path advertised as recoverable.
+    if (hn->addr.chunk < 0) {
+        return;
+    }
     int buffer_id = hn->buffer_id;
     struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
     ggml_backend_buffer_type_t buft = galloc->bufts[buffer_id];
@@ -820,21 +972,94 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
+// whispercpp-sys: gallocr_reserve_n hash_set OOM-safe alloc
+//
+// Mirrors `whispercpp_hash_set_new_or_null` in
+// `ggml-backend.cpp` (duplicated here as a static so this
+// file's edits stay self-contained and the helper isn't
+// exposed in the ABI). Returns `{0, NULL, NULL}` on either
+// allocation failure; callers detect via
+// `result.keys == NULL`.
+static struct ggml_hash_set whispercpp_hash_set_new_or_null_alloc(size_t size) {
+    size = ggml_hash_size(size);
+    struct ggml_hash_set result;
+    result.size = size;
+    result.keys = (struct ggml_tensor **) malloc(sizeof(struct ggml_tensor *) * size);
+    if (result.keys == NULL) {
+        result.size = 0;
+        result.used = NULL;
+        return result;
+    }
+    result.used = (ggml_bitset_t *) calloc(ggml_bitset_size(size), sizeof(ggml_bitset_t));
+    if (result.used == NULL) {
+        free(result.keys);
+        result.keys = NULL;
+        result.size = 0;
+        return result;
+    }
+    return result;
+}
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
 
-    // initialize hash table
-    if (galloc->hash_set.size < min_hash_size) {
-        ggml_hash_set_free(&galloc->hash_set);
-        galloc->hash_set = ggml_hash_set_new(min_hash_size);
-        GGML_ASSERT(galloc->hash_set.keys != NULL);
+    // whispercpp-sys: gallocr_reserve_n_impl OOM-safe paths
+    //
+    // Every `GGML_ASSERT(... != NULL)` in this function was
+    // an abort-on-OOM that bypassed the wrapper's exception
+    // shim. Each is now a `return false` after best-effort
+    // cleanup. The `alloc_failed` sticky flag (set by
+    // `ggml_gallocr_allocate_node` when
+    // `ggml_dyn_tallocr_alloc` runs out of chunks) is also
+    // checked after the graph walk to surface the deeper
+    // allocator's failures.
+    galloc->alloc_failed = false;
 
+    // initialize hash table
+    //
+    // whispercpp-sys: hash_set / hash_values atomic commit
+    //
+    // Allocate both replacements into temporaries first;
+    // commit them only after BOTH succeed. The previous
+    // ordering (free old hash_set → install new hash_set
+    // → free old hash_values → install new hash_values)
+    // could leave the gallocr in a poisoned state: if
+    // the hash_values malloc failed AFTER the new
+    // hash_set was committed, the function returned
+    // false with `hash_set.size > 0` and
+    // `hash_values == NULL`. A retry with the same or
+    // smaller graph then took the
+    // `if (hash_set.size < min_hash_size)` branch as
+    // FALSE (skipping the re-allocation block), reached
+    // `ggml_gallocr_alloc_graph_impl`, and that
+    // function's `memset(galloc->hash_values, 0, ...)`
+    // null-derefed.
+    //
+    // Atomic commit makes the invariant `hash_set.size
+    // > 0 ⟹ hash_values != NULL` structurally
+    // preserved: either both new or both old, never a
+    // mixed state.
+    if (galloc->hash_set.size < min_hash_size) {
+        struct ggml_hash_set new_hash_set = whispercpp_hash_set_new_or_null_alloc(min_hash_size);
+        if (new_hash_set.keys == NULL) {
+            return false;
+        }
+        struct hash_node * new_hash_values = malloc(sizeof(struct hash_node) * new_hash_set.size);
+        if (new_hash_values == NULL) {
+            ggml_hash_set_free(&new_hash_set);
+            return false;
+        }
+        // Both new allocations succeeded — swap and free
+        // the old. From here on no failure mode reaches
+        // the "hash_set.size > 0 with hash_values NULL"
+        // poisoned state.
+        ggml_hash_set_free(&galloc->hash_set);
         free(galloc->hash_values);
-        galloc->hash_values = malloc(sizeof(struct hash_node) * galloc->hash_set.size);
-        GGML_ASSERT(galloc->hash_values != NULL);
+        galloc->hash_set = new_hash_set;
+        galloc->hash_values = new_hash_values;
     }
 
     // reset allocators
@@ -844,12 +1069,38 @@ static bool ggml_gallocr_reserve_n_impl(
 
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    if (galloc->alloc_failed) {
+        // The graph-walk completed but at least one node
+        // couldn't be placed (deeper allocator OOM via
+        // `ggml_dyn_tallocr_new_chunk` calloc failure).
+        return false;
+    }
 
     // set the node_allocs from the hash table
+    //
+    // whispercpp-sys: node_allocs growth transactional
+    //
+    // Allocate into a temporary BEFORE freeing the old
+    // array. The previous order
+    // (free → calloc → return-false-on-fail) left the
+    // gallocr in a poisoned state on failure:
+    // `node_allocs == NULL` while `n_nodes` retained its
+    // old (now-stale) capacity. Because `State::full`
+    // treats most failures as recoverable and keeps the
+    // State alive, a follow-up call with a graph whose
+    // `n_nodes <= old_n_nodes` would skip the
+    // re-allocation block (the `if (n_nodes <
+    // graph->n_nodes)` test is false) and then index
+    // through `galloc->node_allocs[i]` — null deref on the
+    // happy path of a retry. Atomic-commit avoids the
+    // poisoned state entirely.
     if (galloc->n_nodes < graph->n_nodes) {
+        struct node_alloc * new_node_allocs = calloc(graph->n_nodes, sizeof(struct node_alloc));
+        if (new_node_allocs == NULL) {
+            return false;
+        }
         free(galloc->node_allocs);
-        galloc->node_allocs = calloc(graph->n_nodes, sizeof(struct node_alloc));
-        GGML_ASSERT(galloc->node_allocs != NULL);
+        galloc->node_allocs = new_node_allocs;
     }
     galloc->n_nodes = graph->n_nodes;
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -879,10 +1130,17 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
     }
+    // whispercpp-sys: leaf_allocs growth transactional
+    // Same atomic-commit pattern as node_allocs above.
     if (galloc->n_leafs < graph->n_leafs) {
+        // Use the existing struct definition for sizeof
+        // consistency with the field's declared type.
+        struct leaf_alloc * new_leaf_allocs = calloc(graph->n_leafs, sizeof(galloc->leaf_allocs[0]));
+        if (new_leaf_allocs == NULL) {
+            return false;
+        }
         free(galloc->leaf_allocs);
-        galloc->leaf_allocs = calloc(graph->n_leafs, sizeof(galloc->leaf_allocs[0]));
-        GGML_ASSERT(galloc->leaf_allocs != NULL);
+        galloc->leaf_allocs = new_leaf_allocs;
     }
     galloc->n_leafs = graph->n_leafs;
     for (int i = 0; i < graph->n_leafs; i++) {
@@ -900,6 +1158,49 @@ static bool ggml_gallocr_reserve_n_impl(
     }
 
     // reallocate buffers if needed
+    //
+    // whispercpp-sys: vbuffer realloc transactional
+    //
+    // Two related issues with the upstream pattern under
+    // recoverable failure:
+    //
+    //   1. Free-then-alloc on each slot strands aliased
+    //      slots (`buf_tallocs[k] == buf_tallocs[j]`,
+    //      k > j) holding the just-freed pointer until
+    //      iteration k re-aliases. If the alloc at j
+    //      fails, the function returns false WITHOUT
+    //      processing k, leaving `buffers[k]` dangling.
+    //      `ggml_gallocr_free`'s dedup compares pointer
+    //      equality, so dangling-vs-NULL doesn't match and
+    //      `ggml_vbuffer_free` runs again on the same
+    //      pointer — UAF/double-free.
+    //
+    //   2. Even without aliasing, freeing the old vbuffer
+    //      before allocating the new one means a failed
+    //      replacement leaves the slot NULL with no fallback,
+    //      and the gallocr is left smaller than its previous
+    //      working state. The atomic-commit pattern (alloc
+    //      new BEFORE freeing old) keeps the old buffer
+    //      live on failure, so the gallocr remains usable
+    //      against the previous graph.
+    //
+    // Pre-pass: null out aliased slots whose current
+    // pointer equals an earlier slot's. After this pass,
+    // the realloc loop's free is safe — no other slot
+    // references the about-to-be-freed pointer (later
+    // aliased slots are NULL; the alias step in the loop
+    // will re-establish them from the post-realloc
+    // primary).
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        for (int j = 0; j < i; j++) {
+            if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]
+                && galloc->buffers[j] == galloc->buffers[i]) {
+                galloc->buffers[i] = NULL;
+                break;
+            }
+        }
+    }
+
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
         for (int j = 0; j < i; j++) {
@@ -930,15 +1231,20 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
-            ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
+                ggml_vbuffer_free(galloc->buffers[i]);
                 galloc->buffers[i] = NULL;
             } else {
-                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-                if (galloc->buffers[i] == NULL) {
+                // Atomic commit: allocate new BEFORE freeing
+                // old. On failure, the old buffer is still
+                // live and `galloc->buffers[i]` is unchanged.
+                struct vbuffer * new_buf = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                if (new_buf == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
                 }
+                ggml_vbuffer_free(galloc->buffers[i]);
+                galloc->buffers[i] = new_buf;
             }
         }
     }

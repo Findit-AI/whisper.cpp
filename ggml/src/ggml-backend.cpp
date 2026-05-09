@@ -1432,7 +1432,23 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        // whispercpp-sys: sched_alloc_splits reserve_n return check
+        //
+        // `ggml_gallocr_reserve_n` returns false on
+        // recoverable OOM (the `gallocr_reserve_n_impl
+        // OOM-safe paths` patch). Without this check,
+        // the follow-up `ggml_gallocr_alloc_graph`
+        // would run against a galloc whose state may be
+        // partially reset (allocators reset, hash table
+        // possibly resized, but no successful node-level
+        // assignments) — node lookups can read stale
+        // `node_allocs[]` entries or hit a NULL
+        // `galloc->buffers[buffer_id]`. Bail at the
+        // reserve boundary so the failure is clean.
+        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            GGML_LOG_ERROR("%s: failed to reserve graph\n", __func__);
+            return false;
+        }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -1628,6 +1644,50 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     return GGML_STATUS_SUCCESS;
 }
 
+// whispercpp-sys: hash_set_new OOM-safe alloc
+//
+// `ggml_hash_set_new` (defined in `ggml.c`) allocates
+// through `GGML_MALLOC` / `GGML_CALLOC`, whose
+// implementations call `GGML_ABORT("fatal error")` when the
+// underlying `malloc` / `calloc` returns NULL. That abort
+// is uncatchable by the wrapper's C++ exception shim and
+// terminates the process — defeating the OOM-safe state-
+// init contract on the
+// `Context::create_state → whisper_sched_graph_init →
+// ggml_backend_sched_new → ggml_hash_set_new` path.
+//
+// Mirror the upstream construction with raw `malloc` /
+// `calloc`, return a zeroed `ggml_hash_set` (`{0, NULL,
+// NULL}`) on failure. Callers must check `result.keys ==
+// NULL` (post-call) and bail; `ggml_hash_set_free` is
+// safe on the zeroed struct because each `GGML_FREE` /
+// `free(NULL)` is a no-op.
+//
+// The other in-tree caller at `:2069`
+// (`ggml_backend_graph_copy`) is not reached from the
+// wrapper's safe-Rust path; it keeps using the aborting
+// `ggml_hash_set_new` until a separate audit covers
+// runtime graph copies.
+static struct ggml_hash_set whispercpp_hash_set_new_or_null(size_t size) {
+    size = ggml_hash_size(size);
+    struct ggml_hash_set result;
+    result.size = size;
+    result.keys = (struct ggml_tensor **) malloc(sizeof(struct ggml_tensor *) * size);
+    if (result.keys == NULL) {
+        result.size = 0;
+        result.used = NULL;
+        return result;
+    }
+    result.used = (ggml_bitset_t *) calloc(ggml_bitset_size(size), sizeof(ggml_bitset_t));
+    if (result.used == NULL) {
+        free(result.keys);
+        result.keys = NULL;
+        result.size = 0;
+        return result;
+    }
+    return result;
+}
+
 ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_t * backends,
         ggml_backend_buffer_type_t * bufts,
@@ -1639,7 +1699,48 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(n_backends <= GGML_SCHED_MAX_BACKENDS);
     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
 
+    // whispercpp-sys: backend_sched_new OOM-safe alloc
+    //
+    // Upstream's `ggml_backend_sched_new` uses raw
+    // `malloc`/`calloc` and dereferences the returned
+    // pointers without null checks. Under memory pressure
+    // these can return NULL, causing native null
+    // dereferences that bypass the wrapper's C++ exception
+    // shim and abort the process. Validate every
+    // allocation; on any failure, free partially
+    // initialized state via `ggml_backend_sched_free` and
+    // return NULL.
+    //
+    // `ggml_backend_sched_free` is safe to call on a
+    // partially-zeroed `sched`: the initial `calloc`
+    // zero-fills every field, and each free in
+    // `ggml_backend_sched_free` (`ggml_backend_event_free`,
+    // `ggml_gallocr_free`, `ggml_free`,
+    // `ggml_hash_set_free`, plain `free`) tolerates a NULL
+    // / zero argument. As long as `n_backends` and
+    // `n_copies` are set before any failable allocation
+    // (so the cleanup loop bounds are right) and the
+    // hash_set is not freed before initialization, the
+    // path is leak-clean.
+    //
+    // The hash_set call below routes through the OOM-safe
+    // helper `whispercpp_hash_set_new_or_null` rather than
+    // upstream's aborting `ggml_hash_set_new`. The helper
+    // returns a zeroed hash_set on failure; we detect via
+    // `result.keys == NULL` and bail through
+    // `ggml_backend_sched_free` like the other allocation
+    // failures.
+    //
+    // Caller (`whisper_sched_graph_init`) checks for NULL
+    // and returns false; the outer `init_state RAII exit`
+    // catch frees what's been assigned to `state->sched_*`,
+    // and the wrapper surfaces `StateInit { code: None }`
+    // — retryable, no leak.
+
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
+    if (sched == NULL) {
+        return NULL;
+    }
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
@@ -1651,30 +1752,80 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
+    // Set `n_backends` and `n_copies` BEFORE any failable
+    // allocation. `ggml_backend_sched_free` uses these to
+    // bound its cleanup loops; if a later alloc fails and
+    // we hand a partial sched to free, the bounds must be
+    // correct for the calloc'd-zero events to be
+    // skipped/freed cleanly (`ggml_backend_event_free(NULL)`
+    // returns).
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
-    sched->hash_set    = ggml_hash_set_new(graph_size);
+    sched->hash_set    = whispercpp_hash_set_new_or_null(graph_size);
+    if (sched->hash_set.keys == NULL) {
+        // Hash-set keys/used storage failed to allocate.
+        // The struct is zeroed; `ggml_hash_set_free` (called
+        // from `ggml_backend_sched_free` below) treats it as
+        // a no-op. `sched->hash_set.size` is also 0, which
+        // makes the next two `malloc(size * ...)` calls
+        // size-zero and reliably distinguishable; bail
+        // before they happen.
+        ggml_backend_sched_free(sched);
+        return NULL;
+    }
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    if (sched->hv_tensor_backend_ids == NULL) {
+        ggml_backend_sched_free(sched);
+        return NULL;
+    }
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    if (sched->hv_tensor_copies == NULL) {
+        ggml_backend_sched_free(sched);
+        return NULL;
+    }
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
     sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
+    if (sched->node_backend_ids == NULL) {
+        ggml_backend_sched_free(sched);
+        return NULL;
+    }
     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
+    if (sched->leaf_backend_ids == NULL) {
+        ggml_backend_sched_free(sched);
+        return NULL;
+    }
     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
+    if (sched->prev_node_backend_ids == NULL) {
+        ggml_backend_sched_free(sched);
+        return NULL;
+    }
     sched->prev_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_leaf_backend_ids[0]));
+    if (sched->prev_leaf_backend_ids == NULL) {
+        ggml_backend_sched_free(sched);
+        return NULL;
+    }
 
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
 
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+    if (sched->context_buffer == NULL) {
+        ggml_backend_sched_free(sched);
+        return NULL;
+    }
 
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
+    if (sched->splits == NULL) {
+        ggml_backend_sched_free(sched);
+        return NULL;
+    }
     sched->splits_capacity = initial_splits_capacity;
 
     for (int b = 0; b < n_backends; b++) {
@@ -1685,11 +1836,25 @@ ggml_backend_sched_t ggml_backend_sched_new(
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+                if (sched->events[b][c] == NULL) {
+                    // events[b'][c'] for [b'<b] or [b'==b,
+                    // c'<c] are populated; the remainder is
+                    // calloc'd-zero. `ggml_backend_sched_free`
+                    // walks `sched->n_backends * sched->n_copies`
+                    // and `ggml_backend_event_free(NULL)`
+                    // skips the unset slots.
+                    ggml_backend_sched_free(sched);
+                    return NULL;
+                }
             }
         }
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+    if (sched->galloc == NULL) {
+        ggml_backend_sched_free(sched);
+        return NULL;
+    }
     sched->op_offload = op_offload;
 
     ggml_backend_sched_reset(sched);

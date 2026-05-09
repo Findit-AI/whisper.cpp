@@ -27,6 +27,8 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>  // whispercpp-sys: std::unique_ptr in vad_init RAII guard
+#include <stdexcept>  // whispercpp-sys: std::runtime_error for assert-to-throw harden
 #include <random>
 #include <regex>
 #include <set>
@@ -131,6 +133,43 @@ static void whisper_log_callback_default(ggml_log_level level, const char * text
 #define WHISPER_LOG_DEBUG(...)
 #endif
 
+// whispercpp-sys: ggml_init throw-on-null wrapper
+//
+// `ggml_init` was patched (in `ggml/src/ggml.c`) to return
+// NULL on allocation failure instead of `abort()`-ing
+// through `GGML_ABORT` / `GGML_ASSERT(ctx->mem_buffer !=
+// NULL)`. That contract change is only safe if every caller
+// checks the return; pre-patch, many callers in whisper.cpp
+// did not (they relied on the upstream "ggml_init never
+// returns NULL on success path" assumption). Auditing every
+// site individually is fragile — easy to miss a new caller
+// added later.
+//
+// Replace each unchecked `ggml_init(params)` with
+// `whispercpp_ggml_init_or_throw(params)`. Throwing
+// `std::bad_alloc` here lets normal C++ stack unwinding
+// carry the OOM signal through every layer of caller until
+// it reaches the `whispercpp_full_with_state` /
+// `whispercpp_init_from_file_no_state` exception shims at
+// the FFI boundary, which convert it to
+// `WHISPERCPP_ERR_BAD_ALLOC` for the safe Rust wrapper
+// (surfacing as `WhisperError::StateLost` /
+// `WhisperError::ConstructorLost`). Callers don't need to
+// know the contract — they just use the returned context as
+// before, and OOM propagates without process termination.
+//
+// Sentinel: `whispercpp-sys: ggml_init throw-on-null wrapper`
+static struct ggml_context * whispercpp_ggml_init_or_throw(struct ggml_init_params params) {
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        WHISPER_LOG_ERROR(
+            "%s: ggml_init returned NULL (mem_size=%zu, mem_buffer=%p)\n",
+            __func__, params.mem_size, (void *) params.mem_buffer);
+        throw std::bad_alloc();
+    }
+    return ctx;
+}
+
 #define WHISPER_ASSERT(x) \
     do { \
         if (!(x)) { \
@@ -191,7 +230,16 @@ static bool ggml_graph_compute_helper(
       ggml_backend_sched_t   sched,
         struct ggml_cgraph * graph,
                        int   n_threads,
-                      bool   sched_reset = true) {
+                      bool   sched_reset = true,
+       ggml_abort_callback   abort_callback = nullptr,
+                    void *   abort_callback_data = nullptr) {
+    // whispercpp-sys: sched abort callback wiring
+    // the sched-based helper used to ignore
+    // the abort callback entirely, leaving long-running
+    // encoder/decoder graph compute uninterruptible. Wire
+    // the callback to every backend in the sched (mirrors
+    // the single-backend overload above) so cancellation is
+    // observed during compute, not just between stages.
     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
         ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -200,6 +248,11 @@ static bool ggml_graph_compute_helper(
         auto * fn_set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (fn_set_n_threads) {
             fn_set_n_threads(backend, n_threads);
+        }
+
+        auto * fn_set_abort = (ggml_backend_set_abort_callback_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_abort_callback");
+        if (fn_set_abort) {
+            fn_set_abort(backend, abort_callback, abort_callback_data);
         }
     }
 
@@ -411,10 +464,27 @@ static const std::map<whisper_alignment_heads_preset, whisper_aheads> g_aheads {
 
 static std::vector<uint32_t> get_alignment_heads_by_layer(const whisper_context_params & cparams, int il, int32_t n_text_layer, int32_t n_head);
 
+// whispercpp-sys: whisper_mel POD field default-init
+//
+// Pre-patch: `int n_len; int n_len_org; int n_mel;` had no
+// in-class initialisers. `whisper_state` is heap-allocated via
+// `new whisper_state` (no `()` / `{}` form) which leaves these
+// scalars indeterminate until the first
+// `log_mel_spectrogram` / `set_mel` call writes them. The safe
+// Rust wrapper's `State::n_mel_frames()` (issue-2 accessor)
+// reads `state->mel.n_len_org` directly via FFI; a caller that
+// invokes `n_mel_frames()` immediately after `create_state()`
+// (before any `State::full`) reads indeterminate memory —
+// undefined behaviour reachable from safe Rust.
+//
+// Default-init the scalar fields to 0 so reads before any mel
+// computation are deterministic. The first inference still
+// overwrites them; cost is one MOV per field, once per state
+// construction.
 struct whisper_mel {
-    int n_len;
-    int n_len_org;
-    int n_mel;
+    int n_len     = 0;
+    int n_len_org = 0;
+    int n_mel     = 0;
 
     std::vector<float> data;
 };
@@ -470,27 +540,44 @@ struct whisper_segment {
 };
 
 struct whisper_batch {
-    int32_t n_tokens;
+    // whispercpp-sys: batch default init — guards against
+    // `whisper_free_state` firing before `whisper_batch_init`
+    // populates these fields (early-failure paths in
+    // `whisper_init_state`).
+    int32_t n_tokens = 0;
 
-    whisper_token  *  token;
-    whisper_pos    *  pos;
-    int32_t        *  n_seq_id; // always 1, here for consistency with llama.cpp
-    whisper_seq_id ** seq_id;   // null terminated
-    int8_t         *  logits;
+    whisper_token  *  token    = nullptr;
+    whisper_pos    *  pos      = nullptr;
+    int32_t        *  n_seq_id = nullptr; // always 1, here for consistency with llama.cpp
+    whisper_seq_id ** seq_id   = nullptr; // null terminated
+    int8_t         *  logits   = nullptr;
 };
+
+static void whisper_batch_free(struct whisper_batch batch);  // whispercpp-sys: batch_free forward decl
 
 static struct whisper_batch whisper_batch_init(int32_t n_tokens, int32_t n_seq_max) {
     whisper_batch batch = { 0, nullptr, nullptr, nullptr, nullptr, nullptr, };
 
+    // whispercpp-sys: batch_init OOM safety
     batch.token    = (whisper_token *  ) malloc(sizeof(whisper_token)    * (n_tokens));
+    if (!batch.token)    { whisper_batch_free(batch); throw std::bad_alloc{}; }
     batch.pos      = (whisper_pos *)     malloc(sizeof(whisper_pos)      * (n_tokens));
+    if (!batch.pos)      { whisper_batch_free(batch); throw std::bad_alloc{}; }
     batch.n_seq_id = (int32_t *)         malloc(sizeof(int32_t)          * (n_tokens));
+    if (!batch.n_seq_id) { whisper_batch_free(batch); throw std::bad_alloc{}; }
     batch.seq_id   = (whisper_seq_id **) malloc(sizeof(whisper_seq_id *) * (n_tokens + 1));
+    if (!batch.seq_id)   { whisper_batch_free(batch); throw std::bad_alloc{}; }
+    // Zero the slots BEFORE the inner alloc loop so a partial
+    // failure leaves a NULL-terminator walk consistent with
+    // whisper_batch_free's iteration contract.
+    for (int i = 0; i <= n_tokens; ++i) { batch.seq_id[i] = nullptr; }
     for (int i = 0; i < n_tokens; ++i) {
         batch.seq_id[i] = (whisper_seq_id *) malloc(sizeof(whisper_seq_id)   * n_seq_max);
+        if (!batch.seq_id[i]) { whisper_batch_free(batch); throw std::bad_alloc{}; }
     }
     batch.seq_id[n_tokens] = nullptr;
     batch.logits   = (int8_t *)          malloc(sizeof(int8_t)           * n_tokens);
+    if (!batch.logits)   { whisper_batch_free(batch); throw std::bad_alloc{}; }
 
     return batch;
 }
@@ -556,6 +643,27 @@ static bool whisper_sched_graph_init(struct whisper_sched & allocr, std::vector<
     auto & meta  = allocr.meta;
 
     sched = ggml_backend_sched_new(backends.data(), nullptr, backends.size(), WHISPER_MAX_NODES, false, true);
+
+    // whispercpp-sys: sched_graph_init NULL guard
+    //
+    // The submodule patch `backend_sched_new OOM-safe alloc`
+    // makes `ggml_backend_sched_new` return NULL on
+    // recoverable allocation failure (raw `malloc`/`calloc`
+    // returning null, or sub-allocator failures). Without
+    // this guard, the next line's
+    // `ggml_backend_sched_alloc_graph(sched, ...)` would
+    // dereference NULL and crash the process before the
+    // exception shim could surface a clean error to safe
+    // Rust. Returning false routes through
+    // `whisper_init_state`'s normal bool-failure path:
+    // `whisper_free_state(state); return nullptr;` — which
+    // calls `ggml_backend_sched_free` on every
+    // `state->sched_*.sched` (handles NULL via the early
+    // return at the top of that function), so no leak.
+    if (sched == nullptr) {
+        WHISPER_LOG_ERROR("%s: ggml_backend_sched_new returned NULL (recoverable allocation failure)\n", __func__);
+        return false;
+    }
 
     meta.resize(ggml_tensor_overhead()*WHISPER_MAX_NODES + ggml_graph_overhead());
 
@@ -893,7 +1001,7 @@ struct whisper_state {
 
     int lang_id = 0; // english by default
 
-    std::string path_model; // populated by whisper_init_from_file_with_params()
+    std::string path_model; // populated by whisper_init_from_file_with_params
 
 #ifdef WHISPER_USE_COREML
     whisper_coreml_context * ctx_coreml = nullptr;
@@ -948,7 +1056,7 @@ struct whisper_context {
 
     whisper_state * state = nullptr;
 
-    std::string path_model; // populated by whisper_init_from_file_with_params()
+    std::string path_model; // populated by whisper_init_from_file_with_params
 };
 
 struct whisper_global {
@@ -961,6 +1069,7 @@ static whisper_global g_state;
 
 template<typename T>
 static void read_safe(whisper_model_loader * loader, T & dest) {
+    dest = T{};  // whispercpp-sys: read_safe zero-init
     loader->read(loader->context, &dest, sizeof(T));
     BYTESWAP_VALUE(dest);
 }
@@ -1002,6 +1111,7 @@ static bool whisper_kv_cache_init(
     cache.buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!cache.buffer) {
         WHISPER_LOG_ERROR("%s: failed to allocate memory for the kv cache\n", __func__);
+        ggml_free(ctx);  // whispercpp-sys: kv_cache_init alloc-fail frees ctx
         return false;
     }
 
@@ -1014,6 +1124,7 @@ static bool whisper_kv_cache_init(
 
 static void whisper_kv_cache_free(struct whisper_kv_cache & cache) {
     ggml_backend_buffer_free(cache.buffer);
+    cache.buffer = nullptr;  // whispercpp-sys: kv_cache_free idempotent fix
 }
 
 static bool whisper_kv_cache_find_slot(
@@ -1288,7 +1399,15 @@ static size_t aheads_masks_nbytes(struct whisper_aheads_masks & aheads_masks) {
 }
 
 static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params & params) {
-    ggml_log_set(g_state.log_callback, g_state.log_callback_user_data);
+    // whispercpp-sys: ggml_log_set once-per-process
+    // First call writes ggml's static logger callback under
+    // the wrapper's process-wide init_lock; later calls
+    // short-circuit so concurrent inference reads of the
+    // logger globals see a stable pointer.
+    static std::atomic<bool> logger_installed{false};
+    if (!logger_installed.exchange(true)) {
+        ggml_log_set(g_state.log_callback, g_state.log_callback_user_data);
+    }
 
     ggml_backend_dev_t dev = nullptr;
 
@@ -1327,12 +1446,43 @@ static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params & pa
 }
 
 static std::vector<ggml_backend_t> whisper_backend_init(const whisper_context_params & params) {
-    std::vector<ggml_backend_t> result;
+    // whispercpp-sys: backend_init RAII
+    //
+    // The raw `ggml_backend_t` handles produced by
+    // `whisper_backend_init_gpu`, `ggml_backend_dev_init`,
+    // and `ggml_backend_init_by_type` must each survive at
+    // least one throwing operation — `std::vector::push_back`
+    // can throw `bad_alloc` on reallocation, and the
+    // CPU-init failure path explicitly throws
+    // `std::runtime_error` after any GPU / ACCEL backends
+    // have already been created. Without RAII, those
+    // earlier handles leak: `std::vector<ggml_backend_t>`'s
+    // destructor frees only the underlying storage, never
+    // calls `ggml_backend_free` on the raw pointers it
+    // holds. The caller's outer `init_state RAII exit`
+    // catch walks `state->backends`, but the assignment
+    // `state->backends = whisper_backend_init(...)` hasn't
+    // run yet on the throw path — `state->backends` is
+    // empty.
+    //
+    // Accumulate in `std::vector<ggml_backend_ptr>` so each
+    // handle has a `ggml_backend_free` deleter from the
+    // moment it enters the vector. On throw, the vector's
+    // destructor walks the unique_ptrs and frees every
+    // accumulated handle. On success, transfer ownership
+    // to the raw-pointer return vector via a pre-reserved
+    // loop — `reserve` is the only throw point; after it,
+    // `push_back` of a raw pointer is noexcept (no
+    // reallocation, trivial copy), so the release/push
+    // pair is atomic with respect to throws.
+    std::vector<ggml_backend_ptr> guards;
 
-    ggml_backend_t backend_gpu = whisper_backend_init_gpu(params);
-
-    if (backend_gpu) {
-        result.push_back(backend_gpu);
+    {
+        ggml_backend_t backend_gpu = whisper_backend_init_gpu(params);
+        if (backend_gpu) {
+            ggml_backend_ptr owner(backend_gpu);
+            guards.push_back(std::move(owner));  // throw → owner frees backend_gpu
+        }
     }
 
     // ACCEL backends
@@ -1340,21 +1490,35 @@ static std::vector<ggml_backend_t> whisper_backend_init(const whisper_context_pa
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
             WHISPER_LOG_INFO("%s: using %s backend\n", __func__, ggml_backend_dev_name(dev));
-            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-            if (!backend) {
+            ggml_backend_ptr owner(ggml_backend_dev_init(dev, nullptr));
+            if (!owner) {
                 WHISPER_LOG_ERROR("%s: failed to initialize %s backend\n", __func__, ggml_backend_dev_name(dev));
                 continue;
             }
-            result.push_back(backend);
+            guards.push_back(std::move(owner));  // throw → owner frees backend
         }
     }
 
-    ggml_backend_t backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (backend_cpu == nullptr) {
-        throw std::runtime_error("failed to initialize CPU backend");
+    {
+        ggml_backend_ptr cpu_owner(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+        if (!cpu_owner) {
+            // guards' destructor frees every accumulated GPU /
+            // ACCEL backend on unwind — no leak.
+            throw std::runtime_error("failed to initialize CPU backend");
+        }
+        guards.push_back(std::move(cpu_owner));
     }
-    result.push_back(backend_cpu);
 
+    // Transfer ownership atomically. `reserve` is the only
+    // throw point in the loop below; on throw, `guards`
+    // still owns every backend → frees on unwind. After
+    // the reserve, `push_back` of a raw pointer requires
+    // no reallocation and is noexcept.
+    std::vector<ggml_backend_t> result;
+    result.reserve(guards.size());
+    for (auto & g : guards) {
+        result.push_back(g.release());
+    }
     return result;
 }
 
@@ -1518,7 +1682,61 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         read_safe(loader, hparams.n_mels);
         read_safe(loader, hparams.ftype);
 
-        assert(hparams.n_text_state == hparams.n_audio_state);
+        // whispercpp-sys: hparams validation
+        // Bounds chosen to cover all known whisper
+        // checkpoints with headroom. Per-field upper limits
+        // keep `15*n_audio_layer + 24*n_text_layer` (used at
+        // line ~1685 as the n_tensors expression) and every
+        // tensor-shape product well below int32 overflow.
+        if (hparams.n_vocab       <= 0 || hparams.n_vocab       > 200000 ||
+            hparams.n_audio_ctx   <= 0 || hparams.n_audio_ctx   > 8192   ||
+            hparams.n_audio_state <= 0 || hparams.n_audio_state > 16384  ||
+            hparams.n_audio_head  <= 0 || hparams.n_audio_head  > 128    ||
+            hparams.n_audio_layer <= 0 || hparams.n_audio_layer > 256    ||
+            hparams.n_text_ctx    <  64 || hparams.n_text_ctx    > 8192   ||
+            hparams.n_text_state  <= 0 || hparams.n_text_state  > 16384  ||
+            hparams.n_text_head   <= 0 || hparams.n_text_head   > 128    ||
+            hparams.n_text_layer  <= 0 || hparams.n_text_layer  > 256    ||
+            hparams.n_mels        <= 0 || hparams.n_mels        > 1024) {
+            WHISPER_LOG_ERROR("%s: invalid hparams (vocab=%d audio_ctx=%d audio_state=%d audio_head=%d audio_layer=%d text_ctx=%d text_state=%d text_head=%d text_layer=%d mels=%d)\n",
+                __func__, hparams.n_vocab, hparams.n_audio_ctx, hparams.n_audio_state, hparams.n_audio_head, hparams.n_audio_layer,
+                hparams.n_text_ctx, hparams.n_text_state, hparams.n_text_head, hparams.n_text_layer, hparams.n_mels);
+            return false;
+        }
+        // Promote the upstream `assert` (compiled out in
+        // Release) to a runtime check.
+        if (hparams.n_text_state != hparams.n_audio_state) {
+            WHISPER_LOG_ERROR("%s: invalid hparams n_text_state=%d != n_audio_state=%d\n",
+                __func__, hparams.n_text_state, hparams.n_audio_state);
+            return false;
+        }
+
+        // whispercpp-sys: hparams head divisibility check
+        //
+        // Graph builders compute `n_state_head = n_state /
+        // n_head` and use `n_state_head * n_head` to reshape
+        // tensors — when `n_state % n_head != 0`, the integer
+        // division truncates and the reshape's element count
+        // disagrees with the tensor's actual storage. Downstream
+        // ggml ops then `GGML_ASSERT` on shape mismatch and
+        // abort the process from inside `whisper_full_with_state`
+        // — uncatchable by the exception shim. Reject
+        // non-divisible pairs at load so a malformed model
+        // (or a fine-tune that mis-stated its dimensions) fails
+        // here with a clean `WhisperError::ContextLoad` instead
+        // of crashing during the first decode.
+        if (hparams.n_audio_state % hparams.n_audio_head != 0) {
+            WHISPER_LOG_ERROR(
+                "%s: invalid hparams: n_audio_state=%d not divisible by n_audio_head=%d\n",
+                __func__, hparams.n_audio_state, hparams.n_audio_head);
+            return false;
+        }
+        if (hparams.n_text_state % hparams.n_text_head != 0) {
+            WHISPER_LOG_ERROR(
+                "%s: invalid hparams: n_text_state=%d not divisible by n_text_head=%d\n",
+                __func__, hparams.n_text_state, hparams.n_text_head);
+            return false;
+        }
 
         std::string mver = "";
 
@@ -1580,7 +1798,25 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         read_safe(loader, filters.n_mel);
         read_safe(loader, filters.n_fft);
 
-        filters.data.resize(filters.n_mel * filters.n_fft);
+        // whispercpp-sys: filter dim validation
+        // n_mel and n_fft are file-controlled;
+        // signed int32 product is UB on overflow. Validate
+        // both bounds before any allocation.
+        if (filters.n_mel <= 0 || filters.n_mel > 65536) {
+            WHISPER_LOG_ERROR("%s: invalid filters.n_mel=%d (must be 1..=65536)\n", __func__, filters.n_mel);
+            return false;
+        }
+        if (filters.n_fft <= 0 || filters.n_fft > 65536) {
+            WHISPER_LOG_ERROR("%s: invalid filters.n_fft=%d (must be 1..=65536)\n", __func__, filters.n_fft);
+            return false;
+        }
+        const int64_t filter_len64 = (int64_t) filters.n_mel * (int64_t) filters.n_fft;
+        if (filter_len64 <= 0 || filter_len64 > (int64_t) (1u << 30)) {
+            WHISPER_LOG_ERROR("%s: filter dims overflow / unreasonable: n_mel=%d * n_fft=%d = %lld\n", __func__, filters.n_mel, filters.n_fft, (long long) filter_len64);
+            return false;
+        }
+
+        filters.data.resize((size_t) filter_len64);
         loader->read(loader->context, filters.data.data(), filters.data.size() * sizeof(float));
         BYTESWAP_FILTERS(filters);
     }
@@ -1590,11 +1826,54 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         int32_t n_vocab = 0;
         read_safe(loader, n_vocab);
 
-        //if (n_vocab != model.hparams.n_vocab) {
-        //    WHISPER_LOG_ERROR("%s: invalid model file '%s' (bad vocab size %d != %d)\n",
-        //            __func__, fname.c_str(), n_vocab, model.hparams.n_vocab);
-        //    return false;
-        //}
+        // whispercpp-sys: vocab count consistency check
+        //
+        // The loader reads `n_vocab` from the file's vocab
+        // section independently of `model.hparams.n_vocab`
+        // (which was read earlier from the hparams block).
+        // The post-condition every downstream consumer
+        // relies on is `id_to_token.size() == vocab.n_vocab`
+        // (`whisper_process_logits` asserts on this; mismatch
+        // fires `WHISPER_ASSERT` → `abort()`, uncatchable by
+        // the safe-Rust exception shim).
+        //
+        // Three regimes to reject at load time:
+        //
+        //   * `n_vocab < 0` — `read_safe<int32_t>` accepts
+        //     any 32-bit value, so a corrupt file can drop
+        //     a negative count here. The main read loop
+        //     `for (int i = 0; i < n_vocab; ++i)` is a
+        //     no-op, but the synthesis loop at `:1873` is
+        //     `for (int i = n_vocab; i < hparams.n_vocab;
+        //     ++i)` and would walk negative indices,
+        //     synthesising entries with negative token ids
+        //     and printing `hparams.n_vocab - n_vocab` —
+        //     signed overflow UB at `n_vocab == INT_MIN`.
+        //
+        //   * `n_vocab > hparams.n_vocab` — the file's vocab
+        //     section claims MORE tokens than the rest of
+        //     the model expects. The main loop would fill
+        //     `id_to_token` with `n_vocab` entries while
+        //     `vocab.n_vocab` is later assigned
+        //     `hparams.n_vocab` (smaller). Post-condition
+        //     violated.
+        //
+        // The remaining `0 <= n_vocab <= hparams.n_vocab`
+        // range is the legitimate run-or-synthesise path.
+        // Upstream's documented short-vocab synthesis at
+        // `:1873` fills `id_to_token`'s tail with
+        // `[_TT_*]` / `[_extra_token_N]` placeholders;
+        // older checkpoints rely on it.
+        //
+        // Returning `false` from the loader → upstream returns
+        // NULL → wrapper surfaces `WhisperError::ContextLoad`
+        // (leak-free, retryable — no partial native state was
+        // published).
+        if (n_vocab < 0 || n_vocab > model.hparams.n_vocab) {
+            WHISPER_LOG_ERROR("%s: invalid model file (bad vocab size %d, hparams.n_vocab=%d)\n",
+                    __func__, n_vocab, model.hparams.n_vocab);
+            return false;
+        }
 
         std::string word;
         std::vector<char> tmp;
@@ -1618,7 +1897,7 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             vocab.token_to_id[word] = i;
             vocab.id_to_token[i] = word;
 
-            //printf("%s: vocab[%d] = '%s'\n", __func__, i, word.c_str());
+            //printf("%s: vocab[%d] = '%s'\n", __func__, i, word.c_str);
         }
 
         vocab.n_vocab = model.hparams.n_vocab;
@@ -1636,6 +1915,43 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             vocab.token_nosp       += dt;
             vocab.token_not        += dt;
             vocab.token_beg        += dt;
+        }
+
+        // whispercpp-sys: special-token bounds check
+        // hparams validation accepted any
+        // `n_vocab > 0`, but decode (`whisper_process_logits`)
+        // indexes `logits[token_eot]`, `logits[token_not]`,
+        // `logits[token_sot]`, and iterates from
+        // `logprobs.begin + token_beg` against vectors sized
+        // by `vocab.n_vocab`. A malformed model with small
+        // `n_vocab` (e.g. < 50364) leaves the unshifted
+        // English-only special tokens (50256–50363) past the
+        // vector end → OOB read/write reachable from safe
+        // Rust through `Context::new` → `State::full`.
+        //
+        // After the multilingual adjustment above, every
+        // special token id used by decode must lie in
+        // `[0, vocab.n_vocab)`. Reject the load otherwise.
+        {
+            const int n = vocab.n_vocab;
+            const whisper_vocab::id ids[] = {
+                vocab.token_eot,
+                vocab.token_sot,
+                vocab.token_translate,
+                vocab.token_transcribe,
+                vocab.token_solm,
+                vocab.token_prev,
+                vocab.token_nosp,
+                vocab.token_not,
+                vocab.token_beg,
+            };
+            for (auto id : ids) {
+                if (id < 0 || id >= n) {
+                    WHISPER_LOG_ERROR("%s: special token id %d out of range [0, %d)\n",
+                        __func__, (int) id, n);
+                    return false;
+                }
+            }
         }
 
         if (n_vocab < model.hparams.n_vocab) {
@@ -1662,7 +1978,21 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                 } else if (i == vocab.token_beg) {
                     word = "[_BEG_]";
                 } else if (i > vocab.token_sot && i <= vocab.token_sot + vocab.num_languages()) {
-                    word = "[_LANG_" + std::string(whisper_lang_str(i - vocab.token_sot - 1)) + "]";
+                    // whispercpp-sys: lang_str null guard
+                    // `vocab.num_languages` is derived from the
+                    // file-controlled `n_vocab`, so a corrupt
+                    // model can pass a lang id outside `g_lang`'s
+                    // range. `whisper_lang_str` returns NULL for
+                    // unknown ids; constructing
+                    // `std::string(nullptr)` is C++ UB. Fall back
+                    // to the `[_extra_token_N_]` shape on the
+                    // unknown-lang path.
+                    const char * lang_name = whisper_lang_str(i - vocab.token_sot - 1);
+                    if (lang_name == nullptr) {
+                        word = "[_extra_token_" + std::to_string(i) + "]";
+                    } else {
+                        word = "[_LANG_" + std::string(lang_name) + "]";
+                    }
                 } else {
                     word = "[_extra_token_" + std::to_string(i) + "]";
                 }
@@ -1672,6 +2002,22 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         }
 
         WHISPER_LOG_INFO("%s: n_langs       = %d\n", __func__, vocab.num_languages());
+
+        // whispercpp-sys: vocab post-synthesis size check
+        //
+        // After the optional short-vocab synthesis above,
+        // `id_to_token` should hold exactly `vocab.n_vocab`
+        // entries (`hparams.n_vocab` ones written: `n_vocab`
+        // by the main read loop, plus `hparams.n_vocab -
+        // n_vocab` by the synthesis loop). Confirm. If the
+        // sizes diverge, downstream `whisper_process_logits`
+        // would fire `WHISPER_ASSERT` → `abort()`.
+        if ((int) vocab.id_to_token.size() != vocab.n_vocab) {
+            WHISPER_LOG_ERROR(
+                "%s: invalid model file (id_to_token size %zu != vocab.n_vocab %d after load)\n",
+                __func__, vocab.id_to_token.size(), vocab.n_vocab);
+            return false;
+        }
     }
 
     const ggml_type wtype = wctx.wtype;
@@ -1694,13 +2040,42 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                 /*.no_alloc   =*/ true,
             };
 
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) {
+            // whispercpp-sys: model_load RAII for raw ggml allocations
+            //
+            // The raw `ggml_context *` returned by `ggml_init`
+            // must survive two throwing registrations: a
+            // `std::vector::emplace_back` (can throw on
+            // reallocation) and a `std::map::operator[]`
+            // (allocates a tree node, can throw `bad_alloc`).
+            // Without a guard, a throw between `ggml_init`
+            // returning and the registration succeeding leaks
+            // the context — `whisper_free(ctx)` walks
+            // `model.ctxs` / `model.buffers`, never `ctx_map`
+            // (a local `std::map`; its destructor doesn't
+            // free the raw pointers it holds).
+            //
+            // Wrap in `ggml_context_ptr` from `ggml-cpp.h`
+            // (`std::unique_ptr<ggml_context,
+            // ggml_context_deleter>`) until ownership is
+            // committed to `model.ctxs`. Order matters:
+            // register in `model.ctxs` first so a subsequent
+            // `ctx_map[buft] = ctx;` throw still leaves the
+            // context owned by the durable structure
+            // `whisper_free` walks. After `emplace_back`
+            // succeeds, release the guard; on the
+            // `ctx_map[buft] = ctx;` throw path, the outer
+            // `init_context RAII exit` catch reaches
+            // `whisper_free(ctx)` which walks `model.ctxs`
+            // and frees this entry — no leak, no double-free.
+            ggml_context_ptr ctx_guard(ggml_init(params));
+            if (!ctx_guard) {
                 throw std::runtime_error("failed to create ggml context");
             }
+            ggml_context * ctx = ctx_guard.get();
 
-            ctx_map[buft] = ctx;
-            model.ctxs.emplace_back(ctx);
+            model.ctxs.emplace_back(ctx);  // throw → ctx_guard frees ctx
+            ctx_guard.release();           // ownership committed to model.ctxs
+            ctx_map[buft] = ctx;           // throw → whisper_free walks model.ctxs
 
             return ctx;
         }
@@ -1735,7 +2110,25 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             /*.no_alloc   =*/ true,
         };
 
-        ggml_context * ctx = ggml_init(params);
+        // whispercpp-sys: model_load tensor-prep RAII
+        //
+        // The temporary `ctx` owns scratch tensors used to
+        // describe weight shapes inside `create_tensor`.
+        // The chain of `ggml_new_tensor_*` calls below
+        // allocates tensor metadata that ggml stores in this
+        // `ctx`'s arena; `create_tensor` separately
+        // registers strong references in `model.tensors`
+        // (mapped into per-buft contexts via
+        // `get_ctx(buft)`). Without a guard, any throw from
+        // the long `create_tensor` / `ggml_new_tensor_*`
+        // chain leaks `ctx`: it lives only in this local,
+        // isn't in `model.ctxs` or any structure
+        // `whisper_free` walks. Wrap in `ggml_context_ptr`
+        // so the destructor calls `ggml_free` on unwind;
+        // the explicit free at the bottom of the block
+        // becomes the natural scope-exit.
+        ggml_context_ptr ctx_guard(whispercpp_ggml_init_or_throw(params));
+        ggml_context * ctx = ctx_guard.get();
 
         const auto & hparams = model.hparams;
 
@@ -1842,7 +2235,9 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             layer.cross_attn_ln_1_b = create_tensor(ASR_TENSOR_ATTN_OUT_BIAS, ASR_SYSTEM_CROSS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
         }
 
-        ggml_free(ctx);
+        // ctx_guard's destructor calls ggml_free on scope
+        // exit (success OR throw); explicit free no longer
+        // needed.
     }
 
     // allocate tensors in the backend buffers
@@ -1850,12 +2245,28 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         ggml_backend_buffer_type_t buft = p.first;
         ggml_context * ctx = p.second;
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
-        if (buf) {
-            model.buffers.emplace_back(buf);
-
-            size_t size_main = ggml_backend_buffer_get_size(buf);
-            WHISPER_LOG_INFO("%s: %12s total size = %8.2f MB\n", __func__, ggml_backend_buffer_name(buf), size_main / 1e6);
+        if (!buf) {
+            WHISPER_LOG_ERROR("%s: ggml_backend_alloc_ctx_tensors_from_buft() returned null\n", __func__);  // whispercpp-sys: alloc_ctx null check (model_load)
+            return false;
         }
+
+        // whispercpp-sys: model_load buffer-registration RAII
+        //
+        // `model.buffers.emplace_back(buf)` can throw
+        // `bad_alloc` on vector reallocation. Without a
+        // guard, a throw leaks `buf` because it isn't in
+        // `model.buffers` yet and the for-scope local
+        // disappears on unwind. Wrap in
+        // `ggml_backend_buffer_ptr` (defined by `ggml-cpp.h`
+        // over `std::unique_ptr<ggml_backend_buffer,
+        // ggml_backend_buffer_deleter>`) until the
+        // `emplace_back` succeeds, then release.
+        ggml_backend_buffer_ptr buf_guard(buf);
+        model.buffers.emplace_back(buf);  // throw → buf_guard frees buf
+        buf_guard.release();              // model.buffers owns
+
+        size_t size_main = ggml_backend_buffer_get_size(buf);
+        WHISPER_LOG_INFO("%s: %12s total size = %8.2f MB\n", __func__, ggml_backend_buffer_name(buf), size_main / 1e6);
     }
 
     // load weights
@@ -1866,7 +2277,29 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
 
         std::vector<char> read_buf;
 
+        // whispercpp-sys: tensor name tracking
+        // the legacy loader counted loaded
+        // tensors but didn't track WHICH ones, so a corrupt
+        // file repeating one valid tensor name enough times
+        // to satisfy `n_loaded == model.tensors.size`
+        // would pass while leaving other allocated buffers
+        // uninitialised. Inference then runs over garbage
+        // weights. Track the set of loaded names so
+        // duplicates are rejected and missing names are
+        // detected.
+        std::set<std::string> loaded_names;
+
         while (true) {
+            // whispercpp-sys: tensor header validation (model_load)
+            // check EOF BEFORE any read so the
+            // strict short-read loader does not throw
+            // on a clean end-of-tensor-list. The file loader's
+            // eof lambda uses peek so this returns
+            // true at end-of-stream without consuming a byte.
+            if (loader->eof(loader->context)) {
+                break;
+            }
+
             int32_t n_dims;
             int32_t length;
             int32_t ttype;
@@ -1875,15 +2308,36 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             read_safe(loader, length);
             read_safe(loader, ttype);
 
-            if (loader->eof(loader->context)) {
-                break;
+            // Every field is attacker-controlled — validate
+            // before any of them feed ggml helpers, vector
+            // allocations, or signed-int multiplications.
+            if (n_dims < 0 || n_dims > 4) {
+                WHISPER_LOG_ERROR("%s: invalid n_dims=%d in tensor header (must be 0..=4)\n", __func__, n_dims);
+                return false;
             }
-
+            if (length <= 0 || length > 4096) {
+                WHISPER_LOG_ERROR("%s: invalid name length=%d in tensor header (must be 1..=4096)\n", __func__, length);
+                return false;
+            }
+            if (ttype < 0 || ttype >= GGML_TYPE_COUNT) {
+                WHISPER_LOG_ERROR("%s: invalid ttype=%d in tensor header (must be 0..%d)\n", __func__, ttype, GGML_TYPE_COUNT);
+                return false;
+            }
             int32_t nelements = 1;
+            int64_t nelements64 = 1;
             int32_t ne[4] = { 1, 1, 1, 1 };
             for (int i = 0; i < n_dims; ++i) {
                 read_safe(loader, ne[i]);
-                nelements *= ne[i];
+                if (ne[i] <= 0) {
+                    WHISPER_LOG_ERROR("%s: invalid dim[%d]=%d in tensor header (must be > 0)\n", __func__, i, ne[i]);
+                    return false;
+                }
+                nelements64 *= ne[i];
+                if (nelements64 > INT32_MAX) {
+                    WHISPER_LOG_ERROR("%s: nelements overflow at dim[%d]=%d\n", __func__, i, ne[i]);
+                    return false;
+                }
+                nelements = (int32_t) nelements64;
             }
 
             std::string name;
@@ -1893,6 +2347,14 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
 
             if (model.tensors.find(name) == model.tensors.end()) {
                 WHISPER_LOG_ERROR("%s: unknown tensor '%s' in model file\n", __func__, name.data());
+                return false;
+            }
+
+            // whispercpp-sys: tensor name tracking
+            // Reject duplicates so a corrupt file can't
+            // satisfy n_loaded by repeating one tensor.
+            if (!loaded_names.insert(name).second) {
+                WHISPER_LOG_ERROR("%s: duplicate tensor '%s' in model file\n", __func__, name.data());
                 return false;
             }
 
@@ -1938,10 +2400,22 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
 
         WHISPER_LOG_INFO("%s: model size    = %7.2f MB\n", __func__, total_size/1e6);
 
-        if (model.n_loaded == 0) {
-            WHISPER_LOG_WARN("%s: WARN no tensors loaded from model file - assuming empty model for testing\n", __func__);
-        } else if (model.n_loaded != (int) model.tensors.size()) {
-            WHISPER_LOG_ERROR("%s: ERROR not all tensors loaded from model file - expected %zu, got %d\n", __func__, model.tensors.size(), model.n_loaded);
+        // whispercpp-sys: tensor name tracking
+        // — every required tensor must be
+        // present exactly once. The previous count-only
+        // check was satisfiable by repeating one name; now
+        // we verify the loaded-name set MATCHES the
+        // expected set. Empty models (n_loaded == 0) are
+        // also rejected — the upstream "empty model for
+        // testing" pass-through was an attack surface.
+        if (loaded_names.size() != model.tensors.size()) {
+            WHISPER_LOG_ERROR("%s: model file is missing tensors (loaded %zu of %zu expected)\n",
+                __func__, loaded_names.size(), model.tensors.size());
+            for (const auto & kv : model.tensors) {
+                if (loaded_names.find(kv.first) == loaded_names.end()) {
+                    WHISPER_LOG_ERROR("%s:   missing tensor: '%s'\n", __func__, kv.first.c_str());
+                }
+            }
             return false;
         }
     }
@@ -1990,7 +2464,7 @@ static struct ggml_cgraph * whisper_build_graph_conv(
         /*.no_alloc   =*/ true,
     };
 
-    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_context * ctx0 = whispercpp_ggml_init_or_throw(params);
 
     ggml_cgraph * gf = ggml_new_graph(ctx0);
 
@@ -2050,7 +2524,20 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 
     auto & kv_pad = wstate.kv_pad;
 
-    WHISPER_ASSERT(!!kv_pad.buffer);
+    // whispercpp-sys: kv buffer null throws
+    //
+    // `whisper_init_state` allocates `kv_pad.buffer` and
+    // returns NULL if the alloc fails. If the wrapper's
+    // safe init path somehow published a state with a null
+    // KV buffer (a recovery race we can't fully prevent at
+    // the C ABI), graph build would deref it on the next
+    // line. Throw `std::bad_alloc` so the
+    // `whispercpp_full_with_state` shim catches and the
+    // wrapper surfaces `WhisperError::StateLost`.
+    if (!kv_pad.buffer) {
+        WHISPER_LOG_ERROR("%s: kv_pad.buffer is NULL — state was not fully initialised\n", __func__);
+        throw std::bad_alloc();
+    }
 
     const int n_ctx_pad = GGML_PAD(n_ctx, 256);
 
@@ -2060,7 +2547,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
         /*.no_alloc   =*/ true,
     };
 
-    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_context * ctx0 = whispercpp_ggml_init_or_throw(params);
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, WHISPER_MAX_NODES, false);
 
@@ -2289,7 +2776,7 @@ static struct ggml_cgraph * whisper_build_graph_cross(
         /*.no_alloc   =*/ true,
     };
 
-    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_context * ctx0 = whispercpp_ggml_init_or_throw(params);
 
     ggml_cgraph * gf = ggml_new_graph(ctx0);
 
@@ -2403,7 +2890,7 @@ static bool whisper_encode_internal(
         }
 
         if (!whisper_encode_external(wstate)) {
-            if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+            if (!ggml_graph_compute_helper(sched, gf, n_threads, true, abort_callback, abort_callback_data)) {
                 return false;
             }
         } else {
@@ -2428,7 +2915,7 @@ static bool whisper_encode_internal(
             return false;
         }
 
-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        if (!ggml_graph_compute_helper(sched, gf, n_threads, true, abort_callback, abort_callback_data)) {
             return false;
         }
     }
@@ -2444,7 +2931,7 @@ static bool whisper_encode_internal(
             return false;
         }
 
-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        if (!ggml_graph_compute_helper(sched, gf, n_threads, true, abort_callback, abort_callback_data)) {
             return false;
         }
     }
@@ -2466,7 +2953,17 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
     auto & kv_self = wstate.kv_self;
 
-    WHISPER_ASSERT(!!kv_self.buffer);
+    // whispercpp-sys: kv buffer null throws (kv_self variant)
+    //
+    // Same pattern as `kv_pad.buffer` in the encoder graph
+    // builder: throw `std::bad_alloc` if we entered with a
+    // partially-initialised state instead of letting the
+    // graph builder deref a null buffer and abort the
+    // process.
+    if (!kv_self.buffer) {
+        WHISPER_LOG_ERROR("%s: kv_self.buffer is NULL — state was not fully initialised\n", __func__);
+        throw std::bad_alloc();
+    }
 
     const int n_ctx   = kv_self.size;
     const int n_state = hparams.n_text_state;
@@ -2491,7 +2988,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
         /*.no_alloc   =*/ true,
     };
 
-    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_context * ctx0 = whispercpp_ggml_init_or_throw(params);
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, WHISPER_MAX_NODES, false);
 
@@ -2941,7 +3438,7 @@ static bool whisper_decode_internal(
 
         logits = ggml_graph_node(gf, -1);
 
-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        if (!ggml_graph_compute_helper(sched, gf, n_threads, true, abort_callback, abort_callback_data)) {
             return false;
         }
     }
@@ -3373,6 +3870,7 @@ static std::string whisper_openvino_get_path_cache(std::string path_bin) {
 
 struct whisper_state * whisper_init_state(whisper_context * ctx) {
     whisper_state * state = new whisper_state;
+    try {  // whispercpp-sys: init_state RAII entry
 
     state->backends = whisper_backend_init(ctx->params);
     if (state->backends.empty()) {
@@ -3542,6 +4040,10 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
     }
 
     return state;
+    } catch (...) {  // whispercpp-sys: init_state RAII exit
+        whisper_free_state(state);
+        throw;
+    }
 }
 
 int whisper_ctx_init_openvino_encoder_with_state(
@@ -3643,12 +4145,28 @@ struct whisper_context * whisper_init_from_file_with_params_no_state(const char 
     loader.read = [](void * ctx, void * output, size_t read_size) {
         std::ifstream * fin = (std::ifstream*)ctx;
         fin->read((char *)output, read_size);
+        // whispercpp-sys: file loader short-read throws.
+        // STRICT: every short read is an error, including
+        // gcount == 0. The tensor loop checks loader->eof
+        // (peek-based) BEFORE every speculative header read,
+        // so a clean end-of-tensor-list never enters this
+        // path. Hparams / filter / vocab callers MUST get
+        // every byte they asked for or fail loudly.
+        if ((size_t) fin->gcount() != read_size) {
+            throw std::runtime_error("whisper.cpp: short read from model file (truncated/corrupt)");
+        }
         return read_size;
     };
 
     loader.eof = [](void * ctx) {
         std::ifstream * fin = (std::ifstream*)ctx;
-        return fin->eof();
+        // whispercpp-sys: file loader eof peeks.
+        // peek sets eofbit iff there's nothing more to read,
+        // without consuming a byte. Required so the tensor
+        // loop's pre-read eof check is accurate at end-of-
+        // tensor-list (the strict short-read loader would
+        // otherwise throw on a speculative zero-byte read).
+        return fin->peek() == EOF;
     };
 
     loader.close = [](void * ctx) {
@@ -3659,7 +4177,21 @@ struct whisper_context * whisper_init_from_file_with_params_no_state(const char 
     auto ctx = whisper_init_with_params_no_state(&loader, params);
 
     if (ctx) {
-        ctx->path_model = path_model;
+        // whispercpp-sys: path_model assignment guard
+        // `std::string::operator=` can throw
+        // `std::bad_alloc`. The assignment lives OUTSIDE the
+        // RAII try-block inside `whisper_init_with_params_no_state`,
+        // so a throw here would leak the model-loaded
+        // `whisper_context` (full model + backend buffers,
+        // ~1.6 GB on `large-v3-turbo`). Wrap in our own
+        // local guard that frees + rethrows; the outer shim
+        // catch converts the throw to `ConstructorLost`.
+        try {
+            ctx->path_model = path_model;
+        } catch (...) {
+            whisper_free(ctx);
+            throw;
+        }
     }
 
     return ctx;
@@ -3688,6 +4220,13 @@ struct whisper_context * whisper_init_from_buffer_with_params_no_state(void * bu
         memcpy(output, buf->buffer + buf->current_offset, size_to_copy);
         buf->current_offset += size_to_copy;
 
+        // whispercpp-sys: buffer loader short-read throws.
+        // STRICT: any short copy is an error. The tensor
+        // loop's pre-read eof check (`current_offset >=
+        // size`) handles clean end-of-buffer.
+        if (size_to_copy != read_size) {
+            throw std::runtime_error("whisper.cpp: short read from model buffer (truncated/corrupt)");
+        }
         return size_to_copy;
     };
 
@@ -3718,18 +4257,23 @@ struct whisper_context * whisper_init_with_params_no_state(struct whisper_model_
     WHISPER_LOG_INFO("%s: backends   = %zu\n", __func__, ggml_backend_reg_count());
 
     whisper_context * ctx = new whisper_context;
+    try {  // whispercpp-sys: init_context RAII entry
     ctx->params = params;
 
     if (!whisper_model_load(loader, *ctx)) {
         loader->close(loader->context);
         WHISPER_LOG_ERROR("%s: failed to load model\n", __func__);
-        delete ctx;
+        whisper_free(ctx);  // whispercpp-sys: model_load failure uses whisper_free
         return nullptr;
     }
 
     loader->close(loader->context);
 
     return ctx;
+    } catch (...) {  // whispercpp-sys: init_context RAII exit
+        whisper_free(ctx);
+        throw;
+    }
 }
 
 struct whisper_context * whisper_init_from_file_with_params(const char * path_model, struct whisper_context_params params) {
@@ -3957,6 +4501,26 @@ int whisper_decode(struct whisper_context * ctx, const whisper_token * tokens, i
 int whisper_tokenize(struct whisper_context * ctx, const char * text, whisper_token * tokens, int n_max_tokens) {
     const auto res = tokenize(ctx->vocab, text);
 
+    // whispercpp-sys: whisper_tokenize size_t→int overflow guard
+    //
+    // Same overflow class as the `whispercpp_tokenize`
+    // shim's `tokenize size_t→int overflow guard`. Public
+    // `whisper_tokenize` is also reached from
+    // `whisper_full_with_state`'s
+    // initial-prompt tokenization (`:7823`), which then
+    // does `prompt_tokens.resize(-n_needed)` on any
+    // negative return — `-INT_MIN` is signed-overflow UB
+    // on common targets, and a wrap-from-positive size
+    // would request a 2 GiB+ token vector. Bail with
+    // INT_MIN before any cast or negation; the caller's
+    // own INT_MIN check (added by patch
+    // `whisper_tokenize INT_MIN propagation`) routes the
+    // failure into the function's normal error-return
+    // path.
+    if (res.size() > (size_t) INT_MAX) {
+        return INT_MIN;
+    }
+
     if (n_max_tokens < (int) res.size()) {
         WHISPER_LOG_ERROR("%s: too many resulting tokens: %d (max %d)\n", __func__, (int) res.size(), n_max_tokens);
         return -(int) res.size();
@@ -3970,7 +4534,149 @@ int whisper_tokenize(struct whisper_context * ctx, const char * text, whisper_to
 }
 
 int whisper_token_count(struct whisper_context * ctx, const char * text) {
-    return -whisper_tokenize(ctx, text, NULL, 0);
+    // whispercpp-sys: whisper_token_count INT_MIN propagation
+    //
+    // `whisper_tokenize` returns INT_MIN when the input
+    // tokenises to more than INT_MAX tokens (via the
+    // `whisper_tokenize size_t→int overflow guard`
+    // patch). The original `return -whisper_tokenize(...)`
+    // would compute `-INT_MIN` for that input — signed-
+    // overflow UB on common targets. Forward INT_MIN
+    // verbatim instead so callers can still detect the
+    // overflow class (and the value is at least
+    // representable).
+    int n = whisper_tokenize(ctx, text, NULL, 0);
+    if (n == INT_MIN) {
+        return INT_MIN;
+    }
+    return -n;
+}
+
+// whispercpp-sys: no-log token count shim
+//
+// `whisper_tokenize(ctx, text, NULL, 0)` was the obvious
+// "probe for required size" pattern, but its
+// too-small-buffer branch unconditionally emits
+// `WHISPER_LOG_ERROR("too many resulting tokens: %d (max
+// %d)")`. Used as a probe, that means EVERY non-empty
+// tokenization through `Context::tokenize` produces a
+// false-positive error log before succeeding — pollutes
+// production output and makes real tokenizer failures
+// hard to spot.
+//
+// This shim calls the internal `tokenize(vocab, text)`
+// helper directly and returns the token count without
+// going through `whisper_tokenize`'s logging branch. The
+// safe Rust `Context::tokenize` uses it as the
+// pre-allocation probe; the actual write call still goes
+// through `whispercpp_tokenize` (which now never hits
+// the too-small-buffer branch because we size the buffer
+// exactly).
+//
+// Returns the count on success, or `INT_MIN` on caught
+// C++ exception (matches `whispercpp_tokenize`'s
+// exception sentinel; pair with
+// `whispercpp_take_last_tokenize_exception` if needed).
+extern "C" int whispercpp_token_count(struct whisper_context * ctx, const char * text) {
+    try {
+        const auto res = tokenize(ctx->vocab, text);
+        // whispercpp-sys: tokenize size_t→int overflow guard
+        //
+        // `res.size()` is `size_t`. The return contract here
+        // is `int`, with `INT_MIN` reserved for caught
+        // exceptions and other negative values reserved for
+        // `whispercpp_tokenize`'s "buffer too small"
+        // signalling. A naked `(int) res.size()` is
+        // implementation-defined for `size > INT_MAX`
+        // (typically wraps, often to a negative value that
+        // would collide with the buffer-too-small sentinel).
+        // The wrapper accepts unbounded `&str` input — on a
+        // large-memory host an attacker-controlled text
+        // tokenising to more than `INT_MAX` tokens is
+        // reachable from safe Rust. Reject up-front by
+        // surfacing `INT_MIN`; the Rust caller already maps
+        // that to `None`.
+        if (res.size() > (size_t) INT_MAX) {
+            return INT_MIN;
+        }
+        return (int) res.size();
+    } catch (const std::bad_alloc &) {
+        return INT_MIN;
+    } catch (const std::system_error &) {
+        return INT_MIN;
+    } catch (const std::exception &) {
+        return INT_MIN;
+    } catch (...) {
+        return INT_MIN;
+    }
+}
+
+// whispercpp-sys: no-log tokenize shim
+//
+// The previous `whispercpp_tokenize` lived in
+// `whispercpp_shim.cpp` and called upstream
+// `whisper_tokenize`, which logs
+// `WHISPER_LOG_ERROR("too many resulting tokens")` on
+// every too-small-buffer call. The safe Rust
+// `Context::tokenize` paired it with `whispercpp_token_count`
+// as a no-log probe, then re-called `whispercpp_tokenize`
+// with the exact size — TWO upstream `tokenize(vocab,
+// text)` invocations per Rust call (the count discarded
+// the first vector; the write tokenized AGAIN).
+//
+// This single-shot variant calls `tokenize(vocab, text)`
+// once and either copies into the caller's buffer
+// (success) or returns the negative-needed count
+// (too-small) WITHOUT logging. The Rust `Context::tokenize`
+// switches to a "try with generous initial capacity, retry
+// on negative" pattern: one upstream tokenization on the
+// happy path, two only when the input exceeds the initial
+// guess.
+//
+// Return contract:
+// * `>= 0` — token count written (success).
+// * `< 0` and `> INT_MIN` — `-(needed_count)`. Caller
+//   reallocates with `-return` and retries.
+// * `INT_MIN` — caught C++ exception. The class is not
+//   recorded (we removed the thread-local sentinel; the
+//   class wasn't being used Rust-side beyond the drain).
+extern "C" int whispercpp_tokenize(
+    struct whisper_context * ctx,
+    const char * text,
+    whisper_token * tokens,
+    int n_max_tokens)
+{
+    try {
+        const auto res = tokenize(ctx->vocab, text);
+        // whispercpp-sys: tokenize size_t→int overflow guard
+        //
+        // Same overflow class as `whispercpp_token_count`:
+        // `(int) res.size()` is implementation-defined for
+        // `size > INT_MAX`, and `-(int) res.size()` can
+        // compute `-INT_MIN` — signed-overflow UB on common
+        // targets. Bail out before any cast or negation.
+        // Surfacing `INT_MIN` joins the existing "caught
+        // exception" path; the Rust caller maps it to
+        // `None`.
+        if (res.size() > (size_t) INT_MAX) {
+            return INT_MIN;
+        }
+        if (n_max_tokens < (int) res.size()) {
+            return -(int) res.size();
+        }
+        for (int i = 0; i < (int) res.size(); i++) {
+            tokens[i] = res[i];
+        }
+        return (int) res.size();
+    } catch (const std::bad_alloc &) {
+        return INT_MIN;
+    } catch (const std::system_error &) {
+        return INT_MIN;
+    } catch (const std::exception &) {
+        return INT_MIN;
+    } catch (...) {
+        return INT_MIN;
+    }
 }
 
 int whisper_lang_max_id(void) {
@@ -4052,9 +4758,50 @@ int whisper_lang_auto_detect_with_state(
     auto & logits_id = state->decoders[0].logits_id;
     logits_id.clear();
 
+    // whispercpp-sys: auto-detect bounded to model lang range
+    //
+    // Upstream's loop iterates every entry in the
+    // process-global `g_lang` table.
+    // `whisper_token_lang(ctx, id) = token_sot + 1 + id`
+    // is a bare addition with no bound against
+    // `vocab.num_languages()`. When `g_lang.size()` exceeds
+    // the model's actual language-token count (older
+    // multilingual checkpoints stuck at 99 langs after the
+    // table grew to include Cantonese / new languages),
+    // ids past the supported range alias onto
+    // `token_translate`, `token_transcribe`, and further
+    // special slots. Reading `state->logits[task_token]`
+    // as a "language probability" lets auto-detect win on
+    // a task token; the returned id is then fed verbatim
+    // into `whisper_token_lang(ctx, lang_id)` at :7587 to
+    // build the decode prompt — silently producing
+    // wrong-language / task-biased transcripts.
+    //
+    // Filter the candidate set to ids the model actually
+    // carries. Non-multilingual checkpoints have no
+    // language tokens at all (their `num_languages()`
+    // value is meaningless because the multilingual
+    // adjustment block at :1820 was never run); reject
+    // up-front rather than score regular-vocab tokens.
+    if (!ctx->vocab.is_multilingual()) {
+        WHISPER_LOG_ERROR("%s: language auto-detect requires a multilingual model\n", __func__);
+        return -8;
+    }
+    const int n_langs = ctx->vocab.num_languages();
+    if (n_langs <= 0) {
+        WHISPER_LOG_ERROR("%s: model reports zero language tokens\n", __func__);
+        return -9;
+    }
     for (const auto & kv : g_lang) {
+        if (kv.second.first >= n_langs) {
+            continue;
+        }
         const auto token_lang = whisper_token_lang(ctx, kv.second.first);
         logits_id.emplace_back(state->logits[token_lang], kv.second.first);
+    }
+    if (logits_id.empty()) {
+        WHISPER_LOG_ERROR("%s: no model-supported languages in g_lang\n", __func__);
+        return -10;
     }
 
     // sort descending
@@ -4198,8 +4945,29 @@ float * whisper_get_logits_from_state(struct whisper_state * state) {
     return state->logits.data();
 }
 
+// whispercpp-sys: token_to_str sparse-vocab no-throw
+//
+// Pre-patch: `id_to_token.at(token)` threw `std::out_of_range`
+// when `token` was outside the loaded entries. The Rust safe
+// wrapper guards `token < whisper_n_vocab()` before calling
+// in, but `n_vocab` is read from `hparams` while the actual
+// `id_to_token` table is populated from the loaded vocab
+// section. A malformed model whose `hparams.n_vocab` exceeds
+// the actually-loaded vocab entries (sparse vocab) passes the
+// Rust bound check, then trips the `at` throw inside this
+// `extern "C"` function — and a C++ exception unwinding
+// across `extern "C"` is undefined behaviour.
+//
+// Replace `.at()` with `.find()` returning NULL on miss. The
+// Rust wrapper already null-checks the return; missing entries
+// now surface as `None` from `Context::token_to_str` rather
+// than as UB.
 const char * whisper_token_to_str(struct whisper_context * ctx, whisper_token token) {
-    return ctx->vocab.id_to_token.at(token).c_str();
+    auto it = ctx->vocab.id_to_token.find(token);
+    if (it == ctx->vocab.id_to_token.end()) {
+        return NULL;
+    }
+    return it->second.c_str();
 }
 
 whisper_token whisper_token_eot(struct whisper_context * ctx) {
@@ -4295,6 +5063,108 @@ void whisper_reset_timings(struct whisper_context * ctx) {
         ctx->state->n_prompt = 0;
     }
 }
+
+// whispercpp-sys: state-aware timing entry points
+//
+// Upstream `whisper_print_timings(ctx)` and
+// `whisper_reset_timings(ctx)` only operate on
+// `ctx->state` — but the whispercpp Rust wrapper loads
+// contexts via `whisper_init_from_file_with_params_no_state`
+// (`ctx->state == nullptr` always) and runs inference
+// through separately-allocated `whisper_state` instances
+// returned by `whisper_init_state`. The legacy
+// `_print_timings` / `_reset_timings` therefore observe
+// nothing useful in this configuration and silently leave
+// per-state accumulators un-reset.
+//
+// These two wrappers take an explicit `whisper_state *` so
+// the safe Rust API can route through the actually-active
+// state. `_with_state` matches the naming convention
+// upstream already uses for other state-aware variants
+// (`whisper_full_with_state`,
+// `whisper_n_len_from_state`, etc.).
+//
+// **C-linkage wrapping is mandatory.** The shim header
+// declares both as `extern "C"`, and bindgen generates
+// Rust calls against the unmangled C symbol. Defining
+// these as plain C++ (the file is `.cpp`, no `extern "C"`
+// in scope because `whisper.cpp` does not `#include
+// "whispercpp_shim.h"`) emits Itanium-mangled symbols
+// (`_Z35whispercpp_print_timings_with_state...`) that
+// the Rust side cannot resolve. Test binaries that
+// happen not to reference these functions still link
+// because of dead-symbol elimination — the failure only
+// surfaces in a binary that actually calls
+// `State::print_timings` / `State::reset_timings`.
+// Wrapping the definitions in `extern "C"` here forces C
+// linkage so the symbols match what bindgen expects.
+extern "C" {
+
+// whispercpp-sys: state-aware print drops total time
+//
+// Upstream's `whisper_print_timings` reports a "total
+// time" line computed as `ggml_time_us() - ctx->t_start_us`,
+// resetting `ctx->t_start_us` from `whisper_reset_timings`.
+// In the wrapper's `Arc<Context>` + multiple-`State`
+// pattern, that field is a Context-shared timestamp:
+//
+//   * Resetting it from one `State::reset_timings` would
+//     race against any sibling `State::print_timings` on
+//     the same `Arc<Context>`, and silently re-baseline
+//     totals reported by every other state on that
+//     Context.
+//   * The `state-aware reset` shim deliberately does NOT
+//     touch `ctx->t_start_us`; reporting a stale
+//     wall-clock here while every other line has been
+//     zeroed makes the `print_timings` output internally
+//     inconsistent (per-stage counters at 0 alongside a
+//     non-zero "total time" measured from Context init).
+//
+// The state-aware printer therefore emits only state-bound
+// counters plus the load-time read from `ctx->t_load_us`
+// (set once at `whisper_init_*` time and never written
+// during inference — safe for concurrent reads). Total
+// wall-clock since Context creation isn't a per-State
+// metric anyway; callers who want it can read
+// `Context::t_load_us` plus a wall-clock of their own.
+void whispercpp_print_timings_with_state(struct whisper_context * ctx, struct whisper_state * state) {
+    WHISPER_LOG_INFO("\n");
+    WHISPER_LOG_INFO("%s:     load time = %8.2f ms\n", __func__, ctx->t_load_us / 1000.0f);
+    if (state != nullptr) {
+
+        const int32_t n_sample = std::max(1, state->n_sample);
+        const int32_t n_encode = std::max(1, state->n_encode);
+        const int32_t n_decode = std::max(1, state->n_decode);
+        const int32_t n_batchd = std::max(1, state->n_batchd);
+        const int32_t n_prompt = std::max(1, state->n_prompt);
+
+        WHISPER_LOG_INFO("%s:     fallbacks = %3d p / %3d h\n", __func__, state->n_fail_p, state->n_fail_h);
+        WHISPER_LOG_INFO("%s:      mel time = %8.2f ms\n", __func__, state->t_mel_us / 1000.0f);
+        WHISPER_LOG_INFO("%s:   sample time = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * state->t_sample_us, n_sample, 1e-3f * state->t_sample_us / n_sample);
+        WHISPER_LOG_INFO("%s:   encode time = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * state->t_encode_us, n_encode, 1e-3f * state->t_encode_us / n_encode);
+        WHISPER_LOG_INFO("%s:   decode time = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * state->t_decode_us, n_decode, 1e-3f * state->t_decode_us / n_decode);
+        WHISPER_LOG_INFO("%s:   batchd time = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * state->t_batchd_us, n_batchd, 1e-3f * state->t_batchd_us / n_batchd);
+        WHISPER_LOG_INFO("%s:   prompt time = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * state->t_prompt_us, n_prompt, 1e-3f * state->t_prompt_us / n_prompt);
+    }
+}
+
+void whispercpp_reset_timings_with_state(struct whisper_state * state) {
+    if (state != nullptr) {
+        state->t_mel_us = 0;
+        state->t_sample_us = 0;
+        state->t_encode_us = 0;
+        state->t_decode_us = 0;
+        state->t_batchd_us = 0;
+        state->t_prompt_us = 0;
+        state->n_sample = 0;
+        state->n_encode = 0;
+        state->n_decode = 0;
+        state->n_batchd = 0;
+        state->n_prompt = 0;
+    }
+}
+
+} // extern "C"
 
 static int whisper_has_coreml(void) {
 #ifdef WHISPER_USE_COREML
@@ -4618,7 +5488,7 @@ static struct ggml_cgraph * whisper_vad_build_graph(whisper_vad_context & vctx) 
         /*.no_alloc   =*/ true,
     };
 
-    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_context * ctx0 = whispercpp_ggml_init_or_throw(params);
 
     ggml_cgraph * gf = ggml_new_graph(ctx0);
 
@@ -4736,12 +5606,28 @@ struct whisper_vad_context * whisper_vad_init_from_file_with_params(
     loader.read = [](void * ctx, void * output, size_t read_size) {
         std::ifstream * fin = (std::ifstream*)ctx;
         fin->read((char *)output, read_size);
+        // whispercpp-sys: file loader short-read throws.
+        // STRICT: every short read is an error, including
+        // gcount == 0. The tensor loop checks loader->eof
+        // (peek-based) BEFORE every speculative header read,
+        // so a clean end-of-tensor-list never enters this
+        // path. Hparams / filter / vocab callers MUST get
+        // every byte they asked for or fail loudly.
+        if ((size_t) fin->gcount() != read_size) {
+            throw std::runtime_error("whisper.cpp: short read from model file (truncated/corrupt)");
+        }
         return read_size;
     };
 
     loader.eof = [](void * ctx) {
         std::ifstream * fin = (std::ifstream*)ctx;
-        return fin->eof();
+        // whispercpp-sys: file loader eof peeks.
+        // peek sets eofbit iff there's nothing more to read,
+        // without consuming a byte. Required so the tensor
+        // loop's pre-read eof check is accurate at end-of-
+        // tensor-list (the strict short-read loader would
+        // otherwise throw on a speculative zero-byte read).
+        return fin->peek() == EOF;
     };
 
     loader.close = [](void * ctx) {
@@ -4771,7 +5657,18 @@ struct whisper_vad_context * whisper_vad_init_with_params(
         }
     }
 
-    whisper_vad_context * vctx = new whisper_vad_context;
+    // whispercpp-sys: vad_init RAII guard
+    // every `return nullptr` between the
+    // `new whisper_vad_context` allocation and the function's
+    // single `return vctx` would otherwise leak the partially-
+    // built context (backend buffers, ggml contexts, hparams
+    // arrays). Hold ownership in a `std::unique_ptr` with
+    // `whisper_vad_free` as deleter; `release` on the success
+    // path transfers ownership to the caller. All failure paths
+    // run the deleter on scope exit — no manual cleanup needed.
+    std::unique_ptr<whisper_vad_context, void (*)(whisper_vad_context *)>
+        vctx_guard(new whisper_vad_context, whisper_vad_free);
+    whisper_vad_context * vctx = vctx_guard.get();
     vctx->n_threads = params.n_threads;
     vctx->params.use_gpu = params.use_gpu;
     vctx->params.gpu_device = params.gpu_device;
@@ -4848,13 +5745,20 @@ struct whisper_vad_context * whisper_vad_init_with_params(
                 /*.no_alloc   =*/ true,
             };
 
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) {
+            // whispercpp-sys: vad_load RAII for raw ggml allocations
+            // Same pattern as `model_load RAII for raw ggml
+            // allocations` above; the VAD loader has the
+            // identical leak windows around `ctx_map[buft]
+            // = ctx;` and `model.ctxs.emplace_back(ctx);`.
+            ggml_context_ptr ctx_guard(ggml_init(params));
+            if (!ctx_guard) {
                 throw std::runtime_error("failed to create ggml context");
             }
+            ggml_context * ctx = ctx_guard.get();
 
-            ctx_map[buft] = ctx;
-            model.ctxs.emplace_back(ctx);
+            model.ctxs.emplace_back(ctx);  // throw → ctx_guard frees ctx
+            ctx_guard.release();           // ownership committed to model.ctxs
+            ctx_map[buft] = ctx;           // throw → whisper_free walks model.ctxs
 
             return ctx;
         }
@@ -4888,7 +5792,15 @@ struct whisper_vad_context * whisper_vad_init_with_params(
             /*.no_alloc   =*/ true,
         };
 
-        ggml_context * ctx = ggml_init(params);
+        // whispercpp-sys: vad_load tensor-prep RAII
+        // Same pattern as `model_load tensor-prep RAII`
+        // above; the VAD loader's tensor-prep block has the
+        // identical leak window — long `create_tensor` /
+        // `ggml_new_tensor_*` chain against a raw local
+        // `ctx`, freed only at the bottom of the block on
+        // the success path.
+        ggml_context_ptr ctx_guard(whispercpp_ggml_init_or_throw(params));
+        ggml_context * ctx = ctx_guard.get();
         const auto & hparams = model.hparams;
 
         // SFTF precomputed basis matrix
@@ -4972,7 +5884,7 @@ struct whisper_vad_context * whisper_vad_init_with_params(
             ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1)
         );
 
-        ggml_free(ctx);
+        // ctx_guard's destructor calls ggml_free on scope exit.
     }
 
     // allocate tensors in the backend buffers
@@ -4980,12 +5892,21 @@ struct whisper_vad_context * whisper_vad_init_with_params(
         ggml_backend_buffer_type_t buft = p.first;
         ggml_context * ctx = p.second;
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
-        if (buf) {
-            model.buffers.emplace_back(buf);
-
-            size_t size_main = ggml_backend_buffer_get_size(buf);
-            WHISPER_LOG_INFO("%s: %12s total size = %8.2f MB\n", __func__, ggml_backend_buffer_name(buf), size_main / 1e6);
+        if (!buf) {
+            WHISPER_LOG_ERROR("%s: ggml_backend_alloc_ctx_tensors_from_buft() returned null\n", __func__);  // whispercpp-sys: alloc_ctx null check (vad_init)
+            return nullptr;
         }
+
+        // whispercpp-sys: vad_load buffer-registration RAII
+        // Same pattern as `model_load buffer-registration
+        // RAII` above; the VAD loader's buffer registration
+        // has the identical leak window.
+        ggml_backend_buffer_ptr buf_guard(buf);
+        model.buffers.emplace_back(buf);
+        buf_guard.release();
+
+        size_t size_main = ggml_backend_buffer_get_size(buf);
+        WHISPER_LOG_INFO("%s: %12s total size = %8.2f MB\n", __func__, ggml_backend_buffer_name(buf), size_main / 1e6);
     }
 
     // load weights
@@ -4995,6 +5916,14 @@ struct whisper_vad_context * whisper_vad_init_with_params(
         std::vector<char> read_buf;
 
         while (true) {
+            // whispercpp-sys: tensor header validation (vad_init)
+            // See PATCH_NDIMS_VALIDATION_MODEL_LOAD for the
+            // per-field analysis. Same validation, different
+            // return type (`whisper_vad_context *` not `bool`).
+            if (loader->eof(loader->context)) {
+                break;
+            }
+
             int32_t n_dims;
             int32_t length;
             int32_t ttype;
@@ -5003,15 +5932,33 @@ struct whisper_vad_context * whisper_vad_init_with_params(
             read_safe(loader, length);
             read_safe(loader, ttype);
 
-            if (loader->eof(loader->context)) {
-                break;
+            if (n_dims < 0 || n_dims > 4) {
+                WHISPER_LOG_ERROR("%s: invalid n_dims=%d in tensor header (must be 0..=4)\n", __func__, n_dims);
+                return nullptr;
             }
-
+            if (length <= 0 || length > 4096) {
+                WHISPER_LOG_ERROR("%s: invalid name length=%d in tensor header (must be 1..=4096)\n", __func__, length);
+                return nullptr;
+            }
+            if (ttype < 0 || ttype >= GGML_TYPE_COUNT) {
+                WHISPER_LOG_ERROR("%s: invalid ttype=%d in tensor header (must be 0..%d)\n", __func__, ttype, GGML_TYPE_COUNT);
+                return nullptr;
+            }
             int32_t nelements = 1;
+            int64_t nelements64 = 1;
             int32_t ne[4] = { 1, 1, 1, 1 };
             for (int i = 0; i < n_dims; ++i) {
                 read_safe(loader, ne[i]);
-                nelements *= ne[i];
+                if (ne[i] <= 0) {
+                    WHISPER_LOG_ERROR("%s: invalid dim[%d]=%d in tensor header (must be > 0)\n", __func__, i, ne[i]);
+                    return nullptr;
+                }
+                nelements64 *= ne[i];
+                if (nelements64 > INT32_MAX) {
+                    WHISPER_LOG_ERROR("%s: nelements overflow at dim[%d]=%d\n", __func__, i, ne[i]);
+                    return nullptr;
+                }
+                nelements = (int32_t) nelements64;
             }
 
             std::string name;
@@ -5076,11 +6023,16 @@ struct whisper_vad_context * whisper_vad_init_with_params(
     }
 
     if (!whisper_vad_init_context(vctx)) {
-        whisper_vad_free(vctx);
+        // whispercpp-sys: vad_init RAII guard cleans up vctx
+        // on scope exit; explicit `whisper_vad_free(vctx)`
+        // here would be a double-free.
         return nullptr;
     }
 
-    return vctx;
+    // whispercpp-sys: success path — transfer ownership to
+    // the caller. Returning `vctx` directly without release
+    // would have the guard free it as the function returns.
+    return vctx_guard.release();
 }
 
 bool whisper_vad_detect_speech(
@@ -5825,7 +6777,7 @@ static void whisper_suppress_invalid_grammar(
 
     //bool allow_eot = false;
     //for (const auto & stack : grammar.stacks) {
-    //    if (stack.empty()) {
+    //    if (stack.empty) {
     //        allow_eot = true;
     //        break;
     //    }
@@ -5854,7 +6806,7 @@ static void whisper_suppress_invalid_grammar(
     //if (!allow_eot) {
     //    logits[eot] -= params.grammar_penalty;
     //}
-    //fprintf(stderr, "Allowed: (%zu tokens)\n", size - rejects.size());
+    //fprintf(stderr, "Allowed: (%zu tokens)\n", size - rejects.size);
 }
 
 static void whisper_grammar_accept_token(whisper_context & ctx, whisper_grammar & grammar, whisper_token token) {
@@ -5862,7 +6814,7 @@ static void whisper_grammar_accept_token(whisper_context & ctx, whisper_grammar 
         return;
     }
 
-    //fprintf(stderr, "Accept: '%s'\n", ctx.vocab.id_to_token[token].c_str());
+    //fprintf(stderr, "Accept: '%s'\n", ctx.vocab.id_to_token[token].c_str);
 
     const std::string & text = ctx.vocab.id_to_token[token];
 
@@ -6375,7 +7327,7 @@ static void whisper_process_logits(
     //    const auto prob    = probs[i];
     //    const auto logit   = logits[i];
     //    const auto logprob = logprobs[i];
-    //    printf("%16s : prob=%9.5f logit=%9.5f logprob=%9.5f\n", token.c_str(), prob, logit, logprob);
+    //    printf("%16s : prob=%9.5f logit=%9.5f logprob=%9.5f\n", token.c_str, prob, logit, logprob);
     //}
 
     // print sorted
@@ -6904,9 +7856,30 @@ int whisper_full_with_state(
         if (!params.prompt_tokens && params.initial_prompt) {
             prompt_tokens.resize(1024);
             int n_needed = whisper_tokenize(ctx, params.initial_prompt, prompt_tokens.data(), prompt_tokens.size());
+            // whispercpp-sys: whisper_tokenize INT_MIN propagation
+            //
+            // The `whisper_tokenize size_t→int overflow guard`
+            // patch makes `whisper_tokenize` return `INT_MIN`
+            // when the prompt tokenises to more than `INT_MAX`
+            // tokens. Without this caller-side check, the
+            // existing `prompt_tokens.resize(-n_needed)`
+            // computes `-INT_MIN` (signed-overflow UB on
+            // common targets) and would request a 2 GiB+
+            // token vector. Bail with a clean `whisper_full`
+            // failure code so the wrapper surfaces
+            // `WhisperError::Full { code }` instead of
+            // crashing.
+            if (n_needed == INT_MIN) {
+                WHISPER_LOG_ERROR("%s: initial_prompt tokenises to more than INT_MAX tokens\n", __func__);
+                return -1;
+            }
             if (n_needed < 0) {
                 prompt_tokens.resize(-n_needed);
                 n_needed = whisper_tokenize(ctx, params.initial_prompt, prompt_tokens.data(), prompt_tokens.size());
+                if (n_needed == INT_MIN || n_needed < 0) {
+                    WHISPER_LOG_ERROR("%s: initial_prompt tokenisation failed on retry (n_needed=%d)\n", __func__, n_needed);
+                    return -1;
+                }
             }
             prompt_tokens.resize(n_needed);
             params.prompt_tokens   = prompt_tokens.data();
@@ -7432,7 +8405,7 @@ int whisper_full_with_state(
                             continue;
                         }
 
-                        //WHISPER_LOG_DEBUG("%s: decoder %d: token %d, seek_delta %d\n", __func__, j, decoder.sequence.tokens.back().id, decoder.seek_delta);
+                        //WHISPER_LOG_DEBUG("%s: decoder %d: token %d, seek_delta %d\n", __func__, j, decoder.sequence.tokens.back.id, decoder.seek_delta);
 
                         decoder.i_batch = batch.n_tokens;
 
@@ -7552,7 +8525,7 @@ int whisper_full_with_state(
 
             if (success) {
                 //for (auto & token : ctx->decoders[best_decoder_id].sequence.tokens) {
-                //    WHISPER_LOG_DEBUG("%s: token = %d, p = %6.3f, pt = %6.3f, ts = %s, str = %s\n", __func__, token.id, token.p, token.pt, ctx->vocab.id_to_token.at(token.tid).c_str(), ctx->vocab.id_to_token.at(token.id).c_str());
+                //    WHISPER_LOG_DEBUG("%s: token = %d, p = %6.3f, pt = %6.3f, ts = %s, str = %s\n", __func__, token.id, token.p, token.pt, ctx->vocab.id_to_token.at(token.tid).c_str, ctx->vocab.id_to_token.at(token.id).c_str);
                 //}
 
                 break;
@@ -7576,7 +8549,7 @@ int whisper_full_with_state(
             const bool is_no_speech = (state->no_speech_prob > params.no_speech_thold &&
                 best_decoder.sequence.avg_logprobs < params.logprob_thold);
 
-            //WHISPER_LOG_DEBUG("prompt_init.size() = %d, prompt.size() = %d, result_len = %d, seek_delta = %d\n", prompt_init.size(), prompt.size(), result_len, seek_delta);
+            //WHISPER_LOG_DEBUG("prompt_init.size = %d, prompt.size = %d, result_len = %d, seek_delta = %d\n", prompt_init.size, prompt.size, result_len, seek_delta);
 
             // update prompt_past1
             prompt_past1.clear();
@@ -7600,8 +8573,8 @@ int whisper_full_with_state(
 
                 for (int i = 0; i < (int) tokens_cur.size(); i++) {
                     //printf("%s: %18s %6.3f %18s %6.3f\n", __func__,
-                    //        ctx->vocab.id_to_token[tokens_cur[i].id].c_str(), tokens_cur[i].p,
-                    //        ctx->vocab.id_to_token[tokens_cur[i].tid].c_str(), tokens_cur[i].pt);
+                    //        ctx->vocab.id_to_token[tokens_cur[i].id].c_str, tokens_cur[i].p,
+                    //        ctx->vocab.id_to_token[tokens_cur[i].tid].c_str, tokens_cur[i].pt);
 
                     if (params.print_special || tokens_cur[i].id < whisper_token_eot(ctx)) {
                         text += whisper_token_to_str(ctx, tokens_cur[i].id);
@@ -7628,7 +8601,7 @@ int whisper_full_with_state(
                                 }
                             }
 
-                            //printf("tt0 = %d, tt1 = %d, text = %s, token = %s, token_id = %d, tid = %d\n", tt0, tt1, text.c_str(), ctx->vocab.id_to_token[tokens_cur[i].id].c_str(), tokens_cur[i].id, tokens_cur[i].tid);
+                            //printf("tt0 = %d, tt1 = %d, text = %s, token = %s, token_id = %d, tid = %d\n", tt0, tt1, text.c_str, ctx->vocab.id_to_token[tokens_cur[i].id].c_str, tokens_cur[i].id, tokens_cur[i].tid);
 
                             result_all.push_back({ tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next });
                             for (int j = i0; j <= i; j++) {
@@ -8275,7 +9248,7 @@ WHISPER_API const char * whisper_bench_ggml_mul_mat_str(int n_threads) {
                 /*.no_alloc   =*/ false,
             };
 
-            struct ggml_context * ctx0 = ggml_init(gparams);
+            struct ggml_context * ctx0 = whispercpp_ggml_init_or_throw(gparams);
 
             struct ggml_tensor * a = ggml_new_tensor_2d(ctx0, wtype,         N, N);
             struct ggml_tensor * b = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, N, N);
@@ -8731,7 +9704,26 @@ static ggml_tensor * dtw_and_backtrace(ggml_context * ctx, ggml_tensor * x) {
         } else if (t == 2) {
             --j;
         } else {
-            WHISPER_ASSERT(0);
+            // whispercpp-sys: dtw backtrace impossible-case throws
+            //
+            // The DTW backtrace lattice cell `t` is one of
+            // {0, 1, 2} by construction. If the cell ever
+            // holds something else (memory corruption, a
+            // graph-compute failure that left the lattice
+            // partially written, or a bug in upstream's
+            // backtrace fill), the pre-patch
+            // `WHISPER_ASSERT(0)` aborted the process. Throw
+            // `std::runtime_error` instead so the failure
+            // surfaces as `WhisperError::StateLost` through
+            // the `whispercpp_full_with_state` shim
+            // (`WHISPERCPP_ERR_EXCEPTION`). Stops a
+            // misbehaving lattice from terminating the
+            // process from safe Rust.
+            WHISPER_LOG_ERROR(
+                "%s: DTW backtrace cell holds unexpected value t=%d "
+                "(expected 0/1/2) at (i=%lld, j=%lld)\n",
+                __func__, t, (long long) i, (long long) j);
+            throw std::runtime_error("DTW backtrace lattice corrupt");
         }
     }
 
@@ -8803,8 +9795,79 @@ static void whisper_exp_compute_token_level_timestamps_dtw(
 {
     const int n_audio_ctx = state->exp_n_audio_ctx > 0 ? state->exp_n_audio_ctx : ctx->model.hparams.n_audio_ctx;
     WHISPER_ASSERT(medfilt_width % 2);
-    WHISPER_ASSERT(n_frames <= n_audio_ctx * 2);
     WHISPER_ASSERT(ctx->params.dtw_aheads_preset != WHISPER_AHEADS_NONE);
+
+    // whispercpp-sys: dtw t_dtw sentinel init
+    //
+    // Mark every text-token's `t_dtw` as -1 ("not yet
+    // computed") BEFORE any skip path or compute can run.
+    // The successful end-of-function path overwrites these
+    // with real, non-negative timestamps; the WARN+return
+    // skip paths below (audio_ctx mismatch, short medfilt
+    // window) intentionally leave the sentinel in place so
+    // the safe-Rust `Token::t_dtw()` accessor can return
+    // `None` for tokens whose DTW timing is genuinely
+    // unavailable.
+    //
+    // Without this sentinel, a skipped DTW pass left
+    // `t_dtw` at whatever value `whisper_token_data` was
+    // value-initialised with (typically 0 from zero-init)
+    // — indistinguishable from a successfully-computed 0
+    // (token starting at audio offset 0). Callers reading
+    // the i64 directly couldn't tell the difference; they'd
+    // mistake "DTW skipped" for "real timestamp == 0",
+    // corrupting downstream alignment without an error
+    // signal. Contract: `Token::t_dtw()` returns
+    // `Option<i64>`, with `None` covering both "DTW not
+    // enabled at Context construction" and "DTW skipped
+    // for this segment".
+    //
+    // Negative values are unreachable for valid DTW output:
+    // `timestamp = (time_index * 2) + seek` with both terms
+    // non-negative (matrix index, audio offset). So `-1`
+    // can never be a legitimate DTW result; the wrapper
+    // uses it as the `None` sentinel.
+    //
+    // Cost: one pass over text tokens in [i_segment,
+    // i_segment + n_segments). Bounded by `n_text_ctx` ≤ 448
+    // per segment; negligible vs the DTW compute itself.
+    for (size_t s = i_segment; s < i_segment + n_segments; ++s) {
+        for (auto & t : state->result_all[s].tokens) {
+            if (t.id < whisper_token_eot(ctx)) {
+                t.t_dtw = -1;
+            }
+        }
+    }
+
+    // whispercpp-sys: dtw audio_ctx override guard
+    //
+    // Pre-patch: `WHISPER_ASSERT(n_frames <= n_audio_ctx * 2)`
+    // aborted the process when callers set
+    // `Params::set_audio_ctx` to a value smaller than the
+    // current chunk's duration would require. Both knobs are
+    // in the safe Rust API:
+    // - `ContextParams::with_dtw_token_timestamps(true)` to
+    //   enable DTW per context;
+    // - `Params::set_audio_ctx(n)` to shrink the encoder's
+    //   audio context window for short-chunk speed-ups.
+    // Combining DTW with `audio_ctx < chunk_duration_in_2cs_units`
+    // is a legal-but-inconsistent configuration that should
+    // surface a recoverable signal, not abort the process.
+    //
+    // Replace the assert with `WHISPER_LOG_WARN` + `return`.
+    // Affected tokens keep `t_dtw == -1` (set by the
+    // sentinel-init pass above); `Token::t_dtw()` in the
+    // safe wrapper returns `None` so callers get an
+    // explicit "unavailable" signal instead of a misleading
+    // i64. Transcription itself is unaffected — only DTW
+    // timestamps for these segments are skipped.
+    if (n_frames > n_audio_ctx * 2) {
+        WHISPER_LOG_WARN(
+            "%s: DTW skipped: n_frames=%d exceeds n_audio_ctx*2=%d "
+            "(audio_ctx override too small for chunk duration)\n",
+            __func__, n_frames, n_audio_ctx * 2);
+        return;
+    }
 
     // FIXME: Allocating mem everytime we call this func
     // Our ggml buffer should be pre-allocated somewhere during init and reused
@@ -8815,6 +9878,66 @@ static void whisper_exp_compute_token_level_timestamps_dtw(
         /*.no_alloc   =*/ false,
     };
     struct ggml_context * gctx = ggml_init(gparams);
+    if (!gctx) {
+        // whispercpp-sys: dtw scratch alloc-fail throws
+        //
+        // `ggml_init` now returns NULL on allocation failure
+        // (see the `whispercpp-sys: ggml_init OOM-safe
+        // context alloc` patch in `ggml.c`). Pre-patch, ggml
+        // upstream called `GGML_ABORT` on context-malloc
+        // failure and `GGML_ASSERT(ctx->mem_buffer != NULL)`
+        // on arena-malloc failure, both of which terminate
+        // the process via `abort()` before any C++ exception
+        // handler runs. That made this null branch dead
+        // code for the OOM case it claimed to cover —
+        // safe Rust callers under host memory pressure
+        // would crash uncatchably. With the ggml patch in
+        // place, OOM now lands here with `gctx == NULL`,
+        // and the `throw` propagates out through
+        // `whisper_full_with_state` into the
+        // `whispercpp_full_with_state` shim's catch block,
+        // which converts it to `WHISPERCPP_ERR_BAD_ALLOC`
+        // for the safe Rust wrapper (surfacing as
+        // `WhisperError::StateLost`).
+        //
+        // A silent `return` from this `void` helper would
+        // let the caller report `Ok(())` while DTW
+        // timestamps stay at their default-zero values —
+        // silent corruption of the advertised
+        // `Token::t_dtw` output. The throw forces the OOM
+        // signal up to the caller.
+        WHISPER_LOG_ERROR("%s: ggml_init failed for DTW scratch (dtw_mem_size = %zu)\n",
+                          __func__, ctx->params.dtw_mem_size);
+        throw std::bad_alloc();
+    }
+    // whispercpp-sys: dtw scratch RAII guard
+    //
+    // Wrap `gctx` in a `unique_ptr` so any exception thrown
+    // between this allocation and the bottom of the function
+    // (std::vector pushes / `data.resize` / decoder bad_alloc /
+    // ggml graph compute) frees the dtw scratch arena via
+    // stack unwinding. Without this guard the safe-Rust
+    // wrapper's `whispercpp_full_with_state` shim catches the
+    // throw and surfaces `WhisperError::StateLost`, but the
+    // ~`dtw_mem_size` bytes of scratch (default 128 MiB)
+    // would have leaked because the function never reached
+    // the explicit `ggml_free(gctx)` at its end. Repeated
+    // retries under memory pressure would otherwise compound
+    // the leak per failed decode.
+    //
+    // The original explicit `ggml_free(gctx)` at function
+    // exit is removed; the guard's destructor runs on the
+    // normal-return path too.
+    //
+    // `gctx` itself stays a raw pointer because every
+    // `ggml_*` call below threads it as `struct ggml_context
+    // *` through C ABI; we just borrow from the unique_ptr
+    // for the rest of the function body. The null-check above
+    // ensures the unique_ptr is never constructed with a null
+    // pointer (so its destructor never calls
+    // `ggml_free(nullptr)` — a contract some ggml builds
+    // don't strictly honour).
+    std::unique_ptr<struct ggml_context, decltype(&ggml_free)> gctx_guard(gctx, ggml_free);
 
     // Build token sequence that will be passed to decoder
     // sot + [lang] + text result + eot
@@ -8844,15 +9967,63 @@ static void whisper_exp_compute_token_level_timestamps_dtw(
     whisper_kv_cache_clear(state->kv_self);
     whisper_batch_prep_legacy(state->batch, tokens.data(), tokens.size(), 0, 0);
     whisper_kv_cache_seq_rm(state->kv_self, 0, 0, -1);
+    // whispercpp-sys: dtw decode failure throws
+    //
+    // Pre-patch: a `whisper_decode_internal` failure inside
+    // the DTW helper became `WHISPER_ASSERT(0)` →
+    // `GGML_ABORT(...)` → `abort()`. `whisper_decode_internal`
+    // returns `false` on recoverable conditions (scheduler
+    // allocation failure, backend compute failure, OOM
+    // during graph build), so this assert turned ordinary
+    // resource-pressure failures into process termination
+    // reachable from safe Rust through DTW. The shim never
+    // saw the failure.
+    //
+    // Throw `std::bad_alloc` instead so the existing
+    // `whispercpp_full_with_state` exception shim catches
+    // it as `WHISPERCPP_ERR_BAD_ALLOC` and the wrapper
+    // surfaces `WhisperError::StateLost`. We pick
+    // `bad_alloc` because the realistic decoder-failure
+    // causes are allocation-shaped (scheduler buffer alloc,
+    // graph compute scratch); using `runtime_error` would
+    // route through `WHISPERCPP_ERR_EXCEPTION` instead but
+    // surfaces the same way to Rust.
     if (!whisper_decode_internal(*ctx, *state, state->batch, n_threads, true, nullptr, nullptr)) {
-        WHISPER_LOG_INFO("DECODER FAILED\n");
-        WHISPER_ASSERT(0);
+        WHISPER_LOG_ERROR("%s: DTW decoder pass failed\n", __func__);
+        throw std::bad_alloc();
     }
-    WHISPER_ASSERT(state->aheads_cross_QKs != nullptr);
+
+    // whispercpp-sys: dtw aheads_cross_QKs invariants throw
+    //
+    // Pre-patch:
+    //   `WHISPER_ASSERT(state->aheads_cross_QKs != nullptr)`
+    //   `WHISPER_ASSERT(n_audio_tokens <= ne[1])`
+    // both `abort()` on failure. After a successful
+    // `whisper_decode_internal` pass, `aheads_cross_QKs`
+    // should be set — but if it isn't (e.g. a CUDA-side
+    // graph compute failure that returned `true` from the
+    // CPU-visible code path), the assertion aborts before
+    // the wrapper's exception shim catches anything.
+    // Replace with a throw that routes through the shim to
+    // `WhisperError::StateLost`.
+    //
+    // Removed the duplicate `state->aheads_cross_QKs != NULL`
+    // check at the same site — same condition, cluttered the
+    // failure path.
+    if (state->aheads_cross_QKs == nullptr) {
+        WHISPER_LOG_ERROR("%s: aheads_cross_QKs is NULL after DTW decoder pass\n", __func__);
+        throw std::bad_alloc();
+    }
 
     const auto n_audio_tokens = n_frames/2;
-    WHISPER_ASSERT(state->aheads_cross_QKs != NULL);
-    WHISPER_ASSERT(n_audio_tokens <= state->aheads_cross_QKs->ne[1]);
+    if (n_audio_tokens > state->aheads_cross_QKs->ne[1]) {
+        WHISPER_LOG_ERROR(
+            "%s: n_audio_tokens=%lld exceeds aheads_cross_QKs->ne[1]=%lld\n",
+            __func__,
+            (long long) n_audio_tokens,
+            (long long) state->aheads_cross_QKs->ne[1]);
+        throw std::runtime_error("DTW aheads_cross_QKs dimension mismatch");
+    }
     const auto n_tokens = state->aheads_cross_QKs->ne[0];
     const auto n_heads = state->aheads_cross_QKs->ne[2];
 
@@ -8888,7 +10059,48 @@ static void whisper_exp_compute_token_level_timestamps_dtw(
     // Pass median filter - this is done over AUDIO_TOKENS dimension.
     // IN: Tensor with N_ALIGNMENT_HEADS*N_TOKENS*N_AUDIO_TOKENS dims
     // OUT: Same dims
-    median_filter_user_data mf_user_data = {medfilt_width};
+    //
+    // whispercpp-sys: dtw short-window medfilt clamp
+    //
+    // `median_filter` asserts `filter_width < a->ne[2]` (where
+    // `ne[2] = n_audio_tokens`) and `filter_width % 2`. The
+    // caller hardcodes `medfilt_width = 7`, which is fine for
+    // most decode windows but trips the assertion whenever a
+    // segment has `n_audio_tokens <= 7` (i.e. `n_frames <= 14`,
+    // audio ≤ ~140 ms). Reachable from safe Rust whenever DTW
+    // is enabled and the VAD or decoder produces a short final
+    // segment — `WHISPER_ASSERT` calls `abort()`, terminating
+    // the process before the exception shim can catch.
+    //
+    // Adapt down to the largest odd value strictly less than
+    // `n_audio_tokens`. If even `width = 1` is impossible
+    // (`n_audio_tokens <= 1`), skip the DTW pass with a warn —
+    // affected tokens keep `t_dtw == -1` (set by the
+    // sentinel-init pass at function entry), so the safe
+    // wrapper's `Token::t_dtw()` returns `None` for them.
+    // A short-segment skip is preferable to erroring out the
+    // whole `whisper_full` call: streaming pipelines routinely
+    // emit tiny residual segments at chunk boundaries, and
+    // turning every one into `WhisperError::StateLost` would
+    // punish the common case for an edge-case constraint.
+    int effective_medfilt = medfilt_width;
+    if ((int64_t) effective_medfilt >= n_audio_tokens) {
+        // Largest valid filter width strictly less than
+        // n_audio_tokens, bumped down by 1 if even.
+        effective_medfilt = (int) (n_audio_tokens - 1);
+        if ((effective_medfilt > 0) && ((effective_medfilt % 2) == 0)) {
+            effective_medfilt -= 1;
+        }
+    }
+    if (effective_medfilt < 1) {
+        WHISPER_LOG_WARN(
+            "%s: DTW audio window too short for median filter "
+            "(n_audio_tokens=%lld, requested medfilt_width=%d); "
+            "skipping DTW for these segments\n",
+            __func__, (long long) n_audio_tokens, medfilt_width);
+        return;
+    }
+    median_filter_user_data mf_user_data = {effective_medfilt};
     w = ggml_map_custom1(gctx, w, median_filter, 1, &mf_user_data);
 
     // Take mean over columns, scale by -1, reshape to 2D tensor, remove SOT sequence and EOT
@@ -8906,15 +10118,91 @@ static void whisper_exp_compute_token_level_timestamps_dtw(
     struct ggml_cgraph * gf = ggml_new_graph(gctx);
     ggml_build_forward_expand(gf, w);
 
+    // whispercpp-sys: dtw backend compute throws
+    //
+    // Pre-patch: the DTW pass created a CPU backend and
+    // dispatched the graph compute without checking either
+    // call's result. `ggml_backend_init_by_type` returns NULL
+    // on backend-init failure (registered backends list is
+    // empty, or per-backend init failed). `ggml_backend_graph_compute`
+    // returns `enum ggml_status` (`GGML_STATUS_FAILED` /
+    // `GGML_STATUS_ALLOC_FAILED` on compute / scheduler
+    // failures). Either failure mode left `w`'s data
+    // un-written or partially-written before
+    // `dtw_and_backtrace` read it — silent corruption of
+    // `t_dtw` output, or null-deref crashes inside the
+    // backtrace.
+    //
+    // Both routes the failure through the
+    // `whispercpp_full_with_state` exception shim to
+    // `WhisperError::StateLost` — same recovery contract as
+    // the other DTW failure paths.
     ggml_backend_ptr backend { ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr) };
-    ggml_backend_graph_compute(backend.get(), gf);
+    if (!backend) {
+        WHISPER_LOG_ERROR("%s: ggml_backend_init_by_type(CPU) returned NULL\n", __func__);
+        throw std::bad_alloc();
+    }
+    {
+        const enum ggml_status compute_status = ggml_backend_graph_compute(backend.get(), gf);
+        if (compute_status != GGML_STATUS_SUCCESS) {
+            WHISPER_LOG_ERROR(
+                "%s: ggml_backend_graph_compute failed: %s\n",
+                __func__, ggml_status_to_string(compute_status));
+            // ALLOC_FAILED routes through bad_alloc; other
+            // failures go via runtime_error. Both are
+            // shim-caught and surface as
+            // `WhisperError::StateLost` to safe Rust.
+            if (compute_status == GGML_STATUS_ALLOC_FAILED) {
+                throw std::bad_alloc();
+            }
+            throw std::runtime_error("DTW graph compute failed");
+        }
+    }
 
     ggml_tensor * alignment = dtw_and_backtrace(gctx, w);
 
-    // Place timestamps on segments
+    // whispercpp-sys: dtw token assignment bounded
+    //
+    // Place timestamps on segments via a bounded flat list of
+    // text-token pointers, NOT the original nested-iterator
+    // walk. The pre-patch implementation advanced
+    // `seg_i`/`tok_i` through `state->result_all` and, when
+    // `tok_i` reached `seg_i->tokens.end()`, did
+    // `++seg_i; tok_i = seg_i->tokens.begin();` without a
+    // bound check. On the last token of the last segment
+    // `seg_i` becomes `result_all.end()` and dereferencing
+    // it via `->tokens.begin()` is C++ undefined behaviour —
+    // and that path was reachable from safe Rust through
+    // `ContextParams::with_dtw_token_timestamps`.
+    //
+    // The fix builds a flat `std::vector<whisper_token_data*>`
+    // of text-token slots covering the [i_segment,
+    // i_segment + n_segments) range, then walks the
+    // alignment tensor and writes `t_dtw` by index into that
+    // vector. If the DTW alignment output produces more
+    // unique token indices than there are text-token slots
+    // (model anomaly, off-by-one in the alignment lattice,
+    // or a degenerate decode), we log + break instead of
+    // walking past the end.
+    //
+    // Pointer aliasing: storing pointers into
+    // `segment.tokens`'s element storage is safe because
+    // `result_all` and its inner vectors are not resized
+    // during this DTW pass — we don't push to them, just
+    // mutate `t_dtw` in place.
+    std::vector<whisper_token_data*> text_token_slots;
+    for (size_t s = i_segment; s < i_segment + n_segments; ++s) {
+        auto & segment = state->result_all[s];
+        text_token_slots.reserve(text_token_slots.size() + segment.tokens.size());
+        for (auto & t : segment.tokens) {
+            if (t.id < whisper_token_eot(ctx)) {
+                text_token_slots.push_back(&t);
+            }
+        }
+    }
+
     int32_t last_v = 0;
-    auto seg_i = state->result_all.begin() + i_segment;
-    auto tok_i = seg_i->tokens.begin();
+    size_t slot_idx = 0;
     for (int i = 0; i < alignment->ne[1]; ++i) {
         int32_t v = whisper_get_i32_nd(alignment, 0, i, 0, 0);
         if (v != last_v) {
@@ -8922,21 +10210,15 @@ static void whisper_exp_compute_token_level_timestamps_dtw(
             int64_t timestamp = (time_index * 2) + seek; // Each index on DTW result = 20mS audio
             last_v = v;
 
-            // Skip non-text tokens
-            while (!(tok_i->id < whisper_token_eot(ctx))) {
-                ++tok_i;
-                if (tok_i == seg_i->tokens.end()) {
-                    ++seg_i;
-                    tok_i = seg_i->tokens.begin();
-                }
+            if (slot_idx >= text_token_slots.size()) {
+                WHISPER_LOG_WARN(
+                    "%s: DTW alignment produced more token boundaries (i=%d) "
+                    "than text token slots (%zu) over %zu segments; truncating output\n",
+                    __func__, i, text_token_slots.size(), n_segments);
+                break;
             }
-
-            tok_i->t_dtw = timestamp;
-            ++tok_i;
-            if (tok_i == seg_i->tokens.end()) {
-                ++seg_i;
-                tok_i = seg_i->tokens.begin();
-            }
+            text_token_slots[slot_idx]->t_dtw = timestamp;
+            ++slot_idx;
         }
     }
 
@@ -8950,7 +10232,12 @@ static void whisper_exp_compute_token_level_timestamps_dtw(
         fprintf(stderr, "\n");
     }*/
 
-    ggml_free(gctx);
+    // whispercpp-sys: dtw scratch RAII guard handles ggml_free(gctx)
+    // on scope exit (both normal return and stack unwinding from
+    // any std:: throw above). The pre-patch version called
+    // `ggml_free(gctx);` here explicitly; that's now redundant
+    // and was removed so a future refactor that adds an early
+    // return doesn't double-free.
 }
 
 void whisper_log_set(ggml_log_callback log_callback, void * user_data) {
@@ -8964,21 +10251,67 @@ const char * whisper_version(void) {
 }
 
 GGML_ATTRIBUTE_FORMAT(2, 3)
+// whispercpp-sys: log_internal va_copy
+//
+// Pre-patch: `whisper_log_internal` had two soundness
+// problems on the long-message path:
+//
+// 1. va_list reuse without `va_copy`. After `vsnprintf`
+//    consumed the args once, the same `va_list` was
+//    passed to a second `vsnprintf` call. The C standard
+//    says a `va_list` is indeterminate after consumption;
+//    on register-tracking ABIs (AArch64, x86-64 SysV)
+//    the second call reads garbage. Reachable from safe
+//    Rust through the `whispercpp_lang_id` path
+//    (`whisper_lang_id` logs `"unknown language '%s'"`
+//    with the caller-supplied string).
+//
+// 2. Heap-allocation throw point with no RAII cleanup.
+//    `new char[len+1]` could throw `std::bad_alloc`
+//    under memory pressure, and the user's
+//    `log_callback` could also throw. Either unwound
+//    past `va_end` and (on throw inside the try) leaked
+//    the heap buffer.
+//
+// Fix: remove the heap-allocation path entirely. Format
+// into the 1024-byte stack buffer ONCE and, if the
+// message would have been longer, truncate with a
+// trailing `"..."` marker. Single `vsnprintf` call →
+// no `va_copy` needed; no allocation → no throw point;
+// `va_end(args)` runs unconditionally before
+// `log_callback` so a user callback throwing doesn't
+// leave the va_list in an indeterminate-but-not-ended
+// state.
+//
+// Lost capability: log messages over 1024 bytes get
+// truncated. This is acceptable — long messages weren't
+// useful diagnostically (the format strings in
+// whisper.cpp are all bounded except for the
+// caller-string `%s` cases that this exact bug class
+// reports on), and the safe Rust wrapper additionally
+// caps caller-controlled inputs (`lang_id_for` /
+// `Params::set_language` reject inputs > 32 bytes).
 static void whisper_log_internal(ggml_log_level level, const char * format, ...) {
+    char buffer[1024];
     va_list args;
     va_start(args, format);
-    char buffer[1024];
-    int len = vsnprintf(buffer, 1024, format, args);
-    if (len < 1024) {
-        g_state.log_callback(level, buffer, g_state.log_callback_user_data);
-    } else {
-        char* buffer2 = new char[len+1];
-        vsnprintf(buffer2, len+1, format, args);
-        buffer2[len] = 0;
-        g_state.log_callback(level, buffer2, g_state.log_callback_user_data);
-        delete[] buffer2;
-    }
+    int len = vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
+    // `vsnprintf` returns the size that WOULD have been
+    // written (per C99). When `len >= sizeof(buffer)`, the
+    // output was truncated; vsnprintf already null-
+    // terminated `buffer[sizeof(buffer)-1]`. Replace the
+    // last few bytes with `"..."` so consumers see the
+    // truncation explicitly.
+    if (len >= (int) sizeof(buffer)) {
+        // 4 = strlen("...") + 1 NUL. `sizeof(buffer)` is
+        // 1024 here, comfortably ≥ 4.
+        buffer[sizeof(buffer) - 4] = '.';
+        buffer[sizeof(buffer) - 3] = '.';
+        buffer[sizeof(buffer) - 2] = '.';
+        buffer[sizeof(buffer) - 1] = '\0';
+    }
+    g_state.log_callback(level, buffer, g_state.log_callback_user_data);
 }
 
 static void whisper_log_callback_default(ggml_log_level level, const char * text, void * user_data) {
